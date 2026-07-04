@@ -193,6 +193,16 @@
           "top_p": 0.8
         }
       }
+    },
+    "claude-code": {
+      "client_class": "ClaudeCodeClient",
+      "default_model": "claude-sonnet-4-6",
+      "supportsCustomModel": true,
+      "models": {
+        "claude-sonnet-4-6": {},
+        "claude-opus-4-1": {},
+        "claude-haiku-4-5": {}
+      }
     }
   }
 }

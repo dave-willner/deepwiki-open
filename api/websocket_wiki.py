@@ -25,6 +25,7 @@ from api.litellm_client import LiteLLMClient
 from api.openrouter_client import OpenRouterClient
 from api.azureai_client import AzureAIClient
 from api.dashscope_client import DashscopeClient
+from api.claude_code_client import ClaudeCodeClient
 from api.rag import RAG
 
 # Configure logging
@@ -552,6 +553,21 @@ This file contains...
                 model_kwargs=model_kwargs,
                 model_type=ModelType.LLM
             )
+        elif request.provider == "claude-code":
+            logger.info(f"Using Claude Code (Max subscription) with model: {request.model}")
+
+            # Initialize Claude Code client — pinned to the dedicated overflow-2 account (never
+            # Dave's personal main/overflow-1 account); see api/claude_code_client.py for the pin.
+            model = ClaudeCodeClient()
+            model_kwargs = {
+                "model": request.model,
+            }
+
+            api_kwargs = model.convert_inputs_to_api_kwargs(
+                input=prompt,
+                model_kwargs=model_kwargs,
+                model_type=ModelType.LLM
+            )
         elif request.provider == "azure":
             logger.info(f"Using Azure AI with model: {request.model}")
 
@@ -703,6 +719,24 @@ This file contains...
                         f"\nError with AWS Bedrock API: {str(e_bedrock)}\n\n"
                         "Please check that you have set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY "
                         "environment variables with valid credentials."
+                    )
+                    await websocket.send_text(error_msg)
+                    await websocket.close()
+            elif request.provider == "claude-code":
+                try:
+                    logger.info("Making Claude Code (Max subscription) API call")
+                    response = await model.acall(api_kwargs=api_kwargs, model_type=ModelType.LLM)
+                    if isinstance(response, str):
+                        await websocket.send_text(response)
+                    else:
+                        await websocket.send_text(str(response))
+                    await websocket.close()
+                except Exception as e_claude_code:
+                    logger.error(f"Error with Claude Code API: {str(e_claude_code)}")
+                    error_msg = (
+                        f"\nError with Claude Code API: {str(e_claude_code)}\n\n"
+                        "Please check that the pinned overflow-2 Claude Max account is authenticated "
+                        "(`claude auth status` with CLAUDE_CONFIG_DIR=~/.claude-overflow-2)."
                     )
                     await websocket.send_text(error_msg)
                     await websocket.close()
@@ -892,6 +926,32 @@ This file contains...
                                 f"\nError with AWS Bedrock API fallback: {str(e_fallback)}\n\n"
                                 "Please check that you have set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY "
                                 "environment variables with valid credentials."
+                            )
+                            await websocket.send_text(error_msg)
+                    elif request.provider == "claude-code":
+                        try:
+                            fallback_api_kwargs = model.convert_inputs_to_api_kwargs(
+                                input=simplified_prompt,
+                                model_kwargs=model_kwargs,
+                                model_type=ModelType.LLM,
+                            )
+
+                            logger.info("Making fallback Claude Code (Max subscription) API call")
+                            fallback_response = await model.acall(
+                                api_kwargs=fallback_api_kwargs, model_type=ModelType.LLM
+                            )
+
+                            if isinstance(fallback_response, str):
+                                await websocket.send_text(fallback_response)
+                            else:
+                                await websocket.send_text(str(fallback_response))
+                        except Exception as e_fallback:
+                            logger.error(
+                                f"Error with Claude Code API fallback: {str(e_fallback)}"
+                            )
+                            error_msg = (
+                                f"\nError with Claude Code API fallback: {str(e_fallback)}\n\n"
+                                "Please check that the pinned overflow-2 Claude Max account is authenticated."
                             )
                             await websocket.send_text(error_msg)
                     elif request.provider == "azure":
