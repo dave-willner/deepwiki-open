@@ -1,6 +1,7 @@
 import adalflow as adal
 from adalflow.core.types import Document, List
 from adalflow.components.data_process import TextSplitter, ToEmbeddings
+from typing import Tuple
 import os
 import subprocess
 import json
@@ -690,6 +691,86 @@ def get_bitbucket_file_content(repo_url: str, file_path: str, access_token: str 
 
     except Exception as e:
         raise ValueError(f"Failed to get file content: {str(e)}")
+
+
+def get_local_files_context(
+    repo_path: str,
+    file_paths: List[str],
+    # 550_000 chars is a conservative fit under Claude's ~200K-token context window even at a
+    # dense ~3 chars/token for code (≈183K tokens), leaving headroom for the instructional prompt
+    # and a full completion. Empirically, the busiest real wiki page here (Architecture Overview,
+    # 12 files) needed ~437KB — this budget covers that with room to spare, not exactly-sized to it.
+    max_total_chars: int = 550_000,
+) -> Tuple[str, List[str], List[str]]:
+    """
+    Read the FULL content of a known, exact set of files from a local repository, for direct
+    injection into an LLM prompt — bypassing semantic (FAISS) retrieval entirely.
+
+    Why this exists (retrieval-starvation fix, garvis-6vlo): wiki-page generation determines the
+    exact `relevant_files` for a page during the structure step, then generates content for that
+    page from an instructional prompt that is almost entirely page-INVARIANT boilerplate (the same
+    "you are an expert technical writer..." instructions repeated for every page, with only the
+    page title/description/file-list differing). Feeding that whole prompt as a FAISS retrieval
+    query means the query embedding barely varies page-to-page, so semantically-generic top-k
+    chunks get retrieved almost regardless of the page's actual topic — starving pages whose
+    real relevant files never happen to rank in the generic top-k. Since we already KNOW the exact
+    files a page needs, and the repo is on local disk (code never leaves the machine), the robust
+    fix is deterministic: read those exact files' content directly, no similarity search involved.
+
+    Args:
+        repo_path: Local filesystem path to the repository root.
+        file_paths: Repo-relative file paths to read (typically a wiki page's `relevant_files`).
+        max_total_chars: Soft budget across all files combined (the generation model's context
+            window is the real constraint; this just keeps a single pathological file list from
+            producing an unbounded prompt). Files are read in list order; once the budget is
+            exhausted, remaining files are skipped and reported (never silently dropped).
+
+    Returns:
+        Tuple of (context_text, included_file_paths, skipped_file_paths_with_reason).
+        context_text is formatted identically to the existing FAISS-retrieval context
+        ("## File Path: <path>\\n\\n<content>", joined with "\\n\\n" + "-"*10), so callers can
+        drop it into the same CONTEXT_START/CONTEXT_END prompt wrapping unchanged.
+    """
+    normalized_repo_root = os.path.realpath(repo_path)
+    context_parts: List[str] = []
+    included: List[str] = []
+    skipped: List[str] = []
+    remaining_budget = max_total_chars
+
+    for relative_file_path in file_paths:
+        if remaining_budget <= 0:
+            skipped.append(f"{relative_file_path} (context budget exhausted)")
+            continue
+
+        candidate_path = os.path.realpath(os.path.join(normalized_repo_root, relative_file_path))
+        is_inside_repo_root = candidate_path == normalized_repo_root or candidate_path.startswith(
+            normalized_repo_root + os.sep
+        )
+        if not is_inside_repo_root:
+            skipped.append(f"{relative_file_path} (resolves outside repo root, refused)")
+            continue
+
+        if not os.path.isfile(candidate_path):
+            reason = "is a directory, not a file" if os.path.isdir(candidate_path) else "not found on disk"
+            skipped.append(f"{relative_file_path} ({reason})")
+            continue
+
+        try:
+            with open(candidate_path, "r", encoding="utf-8", errors="replace") as file_handle:
+                file_content = file_handle.read()
+        except OSError as read_error:
+            skipped.append(f"{relative_file_path} (read error: {read_error})")
+            continue
+
+        if len(file_content) > remaining_budget:
+            file_content = file_content[:remaining_budget] + "\n... (truncated — context budget exhausted)"
+
+        remaining_budget -= len(file_content)
+        context_parts.append(f"## File Path: {relative_file_path}\n\n{file_content}")
+        included.append(relative_file_path)
+
+    context_text = ("\n\n" + "-" * 10 + "\n\n".join(context_parts)) if context_parts else ""
+    return context_text, included, skipped
 
 
 def get_file_content(repo_url: str, file_path: str, repo_type: str = None, access_token: str = None) -> str:

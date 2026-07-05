@@ -12,7 +12,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from api.config import get_model_config, configs, OPENROUTER_API_KEY, OPENAI_API_KEY, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
-from api.data_pipeline import count_tokens, get_file_content
+from api.data_pipeline import count_tokens, get_file_content, get_local_files_context
 from api.openai_client import OpenAIClient
 from api.openrouter_client import OpenRouterClient
 from api.bedrock_client import BedrockClient
@@ -61,6 +61,16 @@ class ChatCompletionRequest(BaseModel):
     repo_url: str = Field(..., description="URL of the repository to query")
     messages: List[ChatMessage] = Field(..., description="List of chat messages")
     filePath: Optional[str] = Field(None, description="Optional path to a file in the repository to include in the prompt")
+    relevant_files: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Optional exact list of repo-relative file paths known to be relevant (e.g. a wiki "
+            "page's determined relevant_files). When provided for a local repo (type='local'), "
+            "their full content is read directly from disk instead of via FAISS semantic "
+            "retrieval — avoiding retrieval starvation on pages whose real files don't rank in "
+            "a generic top-k for a largely page-invariant instructional query."
+        ),
+    )
     token: Optional[str] = Field(None, description="Personal access token for private repositories")
     type: Optional[str] = Field("github", description="Type of repository (e.g., 'github', 'gitlab', 'bitbucket')")
 
@@ -189,7 +199,26 @@ async def chat_completions_stream(request: ChatCompletionRequest):
         context_text = ""
         retrieved_documents = None
 
-        if not input_too_large:
+        if request.relevant_files and request.type == "local":
+            # Deterministic path (retrieval-starvation fix, garvis-6vlo): we already know the
+            # exact files this generation needs, and the repo is on local disk — read them
+            # directly instead of running them through FAISS semantic retrieval over a query
+            # that's mostly page-invariant boilerplate. Not subject to the input_too_large gate:
+            # that gate exists to protect the EMBEDDING call, which this path never makes.
+            try:
+                context_text, included_files, skipped_files = get_local_files_context(
+                    request.repo_url, request.relevant_files
+                )
+                logger.info(
+                    f"Direct local-file context: {len(included_files)} included, "
+                    f"{len(skipped_files)} skipped"
+                )
+                if skipped_files:
+                    logger.warning(f"Skipped relevant files: {skipped_files}")
+            except Exception as e:
+                logger.error(f"Error reading local relevant files: {str(e)}")
+                context_text = ""
+        elif not input_too_large:
             try:
                 # If filePath exists, modify the query for RAG to focus on the file
                 rag_query = query

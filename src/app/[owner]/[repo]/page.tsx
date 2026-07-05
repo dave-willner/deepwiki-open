@@ -530,6 +530,11 @@ Remember:
         const requestBody: Record<string, any> = {
           repo_url: repoUrl,
           type: effectiveRepoInfo.type,
+          // The exact files this page needs, already determined by the wiki-structure step.
+          // For a local repo, the backend reads these directly from disk instead of relying on
+          // FAISS semantic retrieval over this (largely page-invariant) instructional prompt —
+          // fixes retrieval starvation on pages spanning many files (garvis-6vlo).
+          relevant_files: filePaths,
           messages: [{
             role: 'user',
             content: promptContent
