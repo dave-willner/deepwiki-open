@@ -22,6 +22,18 @@ OAuth keychain lookup gets namespaced by `sha256(CLAUDE_CONFIG_DIR)` and fails.
 
 Embeddings are explicitly out of scope for this provider (Slice 2 uses local Ollama instead) —
 `convert_inputs_to_api_kwargs`/`call`/`acall` all raise `NotImplementedError` for `ModelType.EMBEDDER`.
+
+★ TOOL ISOLATION — `tools=[]` is the field that actually disables built-in tools (Bash, Read, Write, Edit,
+...); `allowed_tools=[]` does NOT (per the SDK's own docstring: "Tool names auto-allowed WITHOUT PROMPTING
+for permission... To restrict which tools are available AT ALL, use `tools` instead."). Found empirically,
+Slice 3/4 gate testing: with only `allowed_tools=[]` set (no `tools=[]`), a sufficiently long/complex prompt
+provoked the model into calling the real Bash tool — `find`, `ls`, `cat` — actually executing and exploring
+the filesystem (including another session's unrelated files under `cwd="/tmp"`), consuming turns until
+`max_turns` was exhausted. `tools=[]` alone (even at `max_turns=1`) fully suppresses this: zero tool calls,
+the model instead correctly reports it lacks the file content rather than fetching it via Bash. BOTH fields
+are now set (`tools=[]` is the one doing the real work; `allowed_tools=[]` kept for defense-in-depth/parity
+with the precedent files, which — misleadingly — used only `allowed_tools=[]` and never actually verified
+tool isolation empirically).
 """
 
 import logging
@@ -193,13 +205,14 @@ class ClaudeCodeClient(ModelClient):
             raise ValueError(f"Model type {model_type} is not supported by ClaudeCodeClient")
 
         # Lazy import so the absence of claude_agent_sdk doesn't break other providers at module import time.
-        from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
+        from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, ToolUseBlock, query
 
         model = api_kwargs.get("model", self._default_model)
         prompt = _guard_leading_slash(api_kwargs.get("input", ""))
 
         options = ClaudeAgentOptions(
             max_turns=1,
+            tools=[],
             allowed_tools=[],
             model=model,
             setting_sources=[],
@@ -214,6 +227,20 @@ class ClaudeCodeClient(ModelClient):
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         full_text += block.text
+                    elif isinstance(block, ToolUseBlock):
+                        # Defense-in-depth (Slice 3/4 finding): `tools=[]` above should make this
+                        # unreachable. If it ever fires anyway, that is a MORE serious isolation
+                        # failure than the one this guard was added for — surface it loudly rather
+                        # than silently ignoring the tool-use attempt the way the original code did.
+                        log.error(
+                            "ClaudeCodeClient: unexpected tool-use attempt despite tools=[]: "
+                            f"name={block.name!r} input={block.input!r}"
+                        )
+                        raise RuntimeError(
+                            f"ClaudeCodeClient: the model attempted to use tool {block.name!r} despite "
+                            "tools=[] — this should be impossible; treat as a critical isolation failure, "
+                            "not a retryable error."
+                        )
 
         return full_text
 
