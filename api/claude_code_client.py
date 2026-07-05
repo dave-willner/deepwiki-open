@@ -61,6 +61,23 @@ def _normalize_dir(path: str) -> str:
     return str(Path(path).expanduser())
 
 
+def _guard_leading_slash(prompt: str) -> str:
+    """Defuse the CLI slash-command footgun (found empirically, Slice 2 gate testing): unlike every other
+    provider in this app (a plain HTTP chat-completion API), `ClaudeCodeClient` drives the actual `claude`
+    CLI's interactive REPL via the SDK. A prompt whose first non-whitespace character is `/` gets parsed as
+    a CLI SLASH COMMAND (e.g. `/no_think` — a literal artifact of this app's universal prompt prefix,
+    `f"/no_think {system_prompt}"`, built for Qwen/Ollama's thinking-mode suppression but applied to every
+    provider's prompt unconditionally) instead of being treated as prompt text. The CLI then silently
+    returns `"Unknown command: /no_think"` as if it were a normal response — no exception, so a naive caller
+    would ship that as the generated wiki content. Verified fix: a single leading space defuses the
+    slash-command parser while leaving the semantic content fully intact (confirmed: the model correctly
+    read and echoed the guarded text back). Only touches prompts that would otherwise misfire; never alters
+    prompt content for prompts that don't start with `/`."""
+    if prompt.startswith("/"):
+        return " " + prompt
+    return prompt
+
+
 def _account_env(account_config_dir: str) -> Dict[str, str]:
     """The pin-and-blank env override (the env-merge trap fix). Pins `CLAUDE_CONFIG_DIR` to the dedicated
     account dir AND strips any inherited `CLAUDE_CODE_OAUTH_TOKEN`/`ANTHROPIC_API_KEY` to `""` — the strip
@@ -179,7 +196,7 @@ class ClaudeCodeClient(ModelClient):
         from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, query
 
         model = api_kwargs.get("model", self._default_model)
-        prompt = api_kwargs.get("input", "")
+        prompt = _guard_leading_slash(api_kwargs.get("input", ""))
 
         options = ClaudeAgentOptions(
             max_turns=1,
