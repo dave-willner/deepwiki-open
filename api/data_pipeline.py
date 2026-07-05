@@ -159,6 +159,27 @@ def download_repo(repo_url: str, local_path: str, repo_type: str = None, access_
 # Alias for backward compatibility
 download_github_repo = download_repo
 
+def _clean_directory_token(raw_dir_entry: str) -> str:
+    """Normalize a directory exclusion/inclusion config entry (e.g. `'./.venv/'`, `'./build/'`) down
+    to its bare directory name (`'.venv'`, `'build'`) for exact path-component comparison.
+
+    Uses LITERAL prefix/suffix removal — only ever strips the exact substrings `'./'` and `'/'` —
+    never `str.strip()`, which strips a *character set* from both ends and keeps eating characters
+    past what you intended: `'./.garvis/'.strip('./')` collapses all the way to `'garvis'` (eating
+    the leading dot too, since '.' is also in the strip set), which then spuriously matches ANY
+    ancestor path component literally named `garvis` — e.g. every repository living under a vault
+    directory `.../garvis/projects/<repo>/...` — silently excluding every file in the whole
+    repository (found live, garvis-9khs: `read_all_documents` on a real project returned 0
+    documents because of exactly this).
+    """
+    token = raw_dir_entry
+    if token.startswith("./"):
+        token = token[2:]
+    if token.endswith("/"):
+        token = token[:-1]
+    return token
+
+
 def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder: bool = None, 
                       excluded_dirs: List[str] = None, excluded_files: List[str] = None,
                       included_dirs: List[str] = None, included_files: List[str] = None):
@@ -267,7 +288,7 @@ def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder:
             # Check if file is in an included directory
             if included_dirs:
                 for included in included_dirs:
-                    clean_included = included.strip("./").rstrip("/")
+                    clean_included = _clean_directory_token(included)
                     if clean_included in file_path_parts:
                         is_included = True
                         break
@@ -296,7 +317,7 @@ def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder:
 
             # Check if file is in an excluded directory
             for excluded in excluded_dirs:
-                clean_excluded = excluded.strip("./").rstrip("/")
+                clean_excluded = _clean_directory_token(excluded)
                 if clean_excluded in file_path_parts:
                     is_excluded = True
                     break
