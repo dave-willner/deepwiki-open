@@ -124,15 +124,35 @@ def _normalize_dir(path: str) -> str:
     return str(Path(path).expanduser())
 
 
+_NO_THINK_PREFIX = "/no_think "
+
+
+def _strip_no_think_prefix(prompt: str) -> str:
+    """Strip this app's universal `"/no_think "` prompt prefix (garvis-ulki) — a Qwen/Ollama
+    thinking-mode-suppression directive (`simple_chat.py`/`websocket_wiki.py` build every provider's
+    prompt as `f"/no_think {system_prompt}"` unconditionally), meaningless to Claude. Previously this
+    reached the CLI and had to be defused with `_guard_leading_slash`'s leading-space trick (see
+    below); stripping it outright is cleaner — no noise-prefix reaches the model at all, and it
+    removes this specific artifact from the leading-slash-guard's job entirely. Only strips the EXACT
+    literal `"/no_think "` prefix (with its trailing space, matching exactly how this app always
+    constructs it) — never touches a prompt that merely starts with a similarly-named but different
+    word (e.g. `"/no_thinking_about_it"`), and never touches prompts that don't have this prefix."""
+    if prompt.startswith(_NO_THINK_PREFIX):
+        return prompt[len(_NO_THINK_PREFIX):]
+    return prompt
+
+
 def _guard_leading_slash(prompt: str) -> str:
     """Defuse the CLI slash-command footgun (found empirically, Slice 2 gate testing): unlike every other
     provider in this app (a plain HTTP chat-completion API), `ClaudeCodeClient` drives the actual `claude`
     CLI's interactive REPL via the SDK. A prompt whose first non-whitespace character is `/` gets parsed as
-    a CLI SLASH COMMAND (e.g. `/no_think` — a literal artifact of this app's universal prompt prefix,
-    `f"/no_think {system_prompt}"`, built for Qwen/Ollama's thinking-mode suppression but applied to every
-    provider's prompt unconditionally) instead of being treated as prompt text. The CLI then silently
-    returns `"Unknown command: /no_think"` as if it were a normal response — no exception, so a naive caller
-    would ship that as the generated wiki content. Verified fix: a single leading space defuses the
+    a CLI SLASH COMMAND instead of being treated as prompt text — the CLI then silently returns
+    `"Unknown command: /whatever"` as if it were a normal response, no exception, so a naive caller would
+    ship that as the generated wiki content. This was FIRST found via this app's universal `/no_think`
+    prompt prefix (built for Qwen/Ollama's thinking-mode suppression, applied to every provider
+    unconditionally) — that specific artifact is now stripped outright before it ever reaches here (see
+    `_strip_no_think_prefix`, garvis-ulki), but this guard remains as the general backstop for any OTHER
+    leading-slash prompt this app might construct. Verified fix: a single leading space defuses the
     slash-command parser while leaving the semantic content fully intact (confirmed: the model correctly
     read and echoed the guarded text back). Only touches prompts that would otherwise misfire; never alters
     prompt content for prompts that don't start with `/`."""
@@ -273,7 +293,7 @@ class ClaudeCodeClient(ModelClient):
         from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, ToolUseBlock, query
 
         model = api_kwargs.get("model", self._default_model)
-        prompt = _guard_leading_slash(api_kwargs.get("input", ""))
+        prompt = _guard_leading_slash(_strip_no_think_prefix(api_kwargs.get("input", "")))
 
         options = ClaudeAgentOptions(
             max_turns=1,

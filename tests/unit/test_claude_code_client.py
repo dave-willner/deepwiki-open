@@ -26,6 +26,7 @@ from api.claude_code_client import (
     OVERFLOW_2_CONFIG_DIR,
     OVERFLOW_3_CONFIG_DIR,
     _guard_leading_slash,
+    _strip_no_think_prefix,
 )
 
 # A fake identity probe standing in for a real `claude auth status` subprocess call, so every test
@@ -160,6 +161,83 @@ def test_guard_leading_slash_passthrough_for_normal_prompts():
 
 def test_guard_leading_slash_passthrough_for_empty_string():
     assert _guard_leading_slash("") == ""
+
+
+# --- garvis-ulki: strip the Qwen /no_think prefix instead of space-guarding it ---
+
+
+def test_strip_no_think_prefix_removes_the_exact_artifact():
+    """This app prepends `f"/no_think {system_prompt}"` to EVERY provider's prompt (a Qwen/Ollama
+    thinking-mode suppression directive, meaningless to Claude). Stripping it outright means no
+    noise-prefix reaches the model at all — cleaner than defusing it with a leading space."""
+    stripped = _strip_no_think_prefix("/no_think You are a helpful assistant.\n\n")
+    assert stripped == "You are a helpful assistant.\n\n"
+    assert "no_think" not in stripped
+
+
+def test_strip_no_think_prefix_passthrough_when_absent():
+    assert _strip_no_think_prefix("Explain this repository.") == "Explain this repository."
+
+
+def test_strip_no_think_prefix_passthrough_for_empty_string():
+    assert _strip_no_think_prefix("") == ""
+
+
+def test_strip_no_think_prefix_does_not_touch_a_similarly_named_but_different_command():
+    """Only the EXACT literal artifact ("/no_think " with its trailing space, matching exactly how
+    this app always constructs it) is stripped — a different, unrelated leading slash-word is left
+    alone for `_guard_leading_slash` to handle as the general backstop."""
+    prompt = "/no_thinking_about_it, let's go"
+    assert _strip_no_think_prefix(prompt) == prompt
+
+
+def test_acall_strips_no_think_prefix_before_reaching_the_sdk():
+    """Integration-ish: the actual prompt handed to `query()` must contain no "/no_think" artifact
+    at all — not just be defused with a leading space."""
+    import asyncio
+
+    captured = {}
+
+    async def fake_query(*, prompt, options):
+        captured["prompt"] = prompt
+        return
+        yield  # pragma: no cover
+
+    async def run():
+        with patch("claude_agent_sdk.query", fake_query):
+            client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
+            await client.acall(
+                api_kwargs={"model": "claude-sonnet-4-6", "input": "/no_think You are helpful.\n\n<query>hi</query>"},
+                model_type=ModelType.LLM,
+            )
+
+    asyncio.run(run())
+    assert "no_think" not in captured["prompt"]
+    assert captured["prompt"] == "You are helpful.\n\n<query>hi</query>"
+
+
+def test_acall_still_guards_other_leading_slashes_as_a_backstop():
+    """`_guard_leading_slash` remains the general backstop for any OTHER leading-slash prompt this
+    app might ever construct — only the specific /no_think artifact is stripped outright."""
+    import asyncio
+
+    captured = {}
+
+    async def fake_query(*, prompt, options):
+        captured["prompt"] = prompt
+        return
+        yield  # pragma: no cover
+
+    async def run():
+        with patch("claude_agent_sdk.query", fake_query):
+            client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
+            await client.acall(
+                api_kwargs={"model": "claude-sonnet-4-6", "input": "/some-other-command text"},
+                model_type=ModelType.LLM,
+            )
+
+    asyncio.run(run())
+    assert captured["prompt"] == " /some-other-command text"
 
 
 @pytest.mark.asyncio
