@@ -148,6 +148,46 @@ def test_identity_guard_receives_the_account_config_dir_under_test():
     assert seen["dir"] == OVERFLOW_3_CONFIG_DIR
 
 
+# --- DEEPWIKI_CLAUDE_ACCOUNT_DIR env-var fallback (backup-account switch without a code change) ---
+
+
+def test_omitted_account_config_dir_defaults_to_overflow_2_when_env_unset(monkeypatch):
+    monkeypatch.delenv("DEEPWIKI_CLAUDE_ACCOUNT_DIR", raising=False)
+    client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
+    assert client._account_config_dir == OVERFLOW_2_CONFIG_DIR
+
+
+def test_omitted_account_config_dir_honors_env_var_override(monkeypatch):
+    monkeypatch.setenv("DEEPWIKI_CLAUDE_ACCOUNT_DIR", OVERFLOW_3_CONFIG_DIR)
+    client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
+    assert client._account_config_dir == OVERFLOW_3_CONFIG_DIR
+
+
+def test_explicit_account_config_dir_wins_over_env_var(monkeypatch):
+    """An explicitly-passed account_config_dir must always take priority over the env-var fallback —
+    the env var only fills in when the caller passes nothing at all."""
+    monkeypatch.setenv("DEEPWIKI_CLAUDE_ACCOUNT_DIR", OVERFLOW_3_CONFIG_DIR)
+    client = ClaudeCodeClient(account_config_dir=OVERFLOW_2_CONFIG_DIR, identity_probe=_FAKE_ALLOWED_PROBE)
+    assert client._account_config_dir == OVERFLOW_2_CONFIG_DIR
+
+
+def test_env_var_pointing_at_a_disallowed_dir_still_refuses():
+    """The env-var fallback does not bypass the allow-list — a misconfigured env var pointing at main
+    must still refuse loudly, exactly like an explicit bad account_config_dir would."""
+    import os
+
+    old = os.environ.get("DEEPWIKI_CLAUDE_ACCOUNT_DIR")
+    os.environ["DEEPWIKI_CLAUDE_ACCOUNT_DIR"] = "/Users/dwillner/.claude"
+    try:
+        with pytest.raises(DisallowedAccountDirError):
+            ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
+    finally:
+        if old is None:
+            os.environ.pop("DEEPWIKI_CLAUDE_ACCOUNT_DIR", None)
+        else:
+            os.environ["DEEPWIKI_CLAUDE_ACCOUNT_DIR"] = old
+
+
 def test_guard_leading_slash_defuses_no_think_prefix():
     """The exact real-world artifact this guard exists for: this app's universal prompt prefix."""
     guarded = _guard_leading_slash("/no_think You are a helpful assistant.\n\n")

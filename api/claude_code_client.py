@@ -194,7 +194,7 @@ class ClaudeCodeClient(ModelClient):
 
     def __init__(
         self,
-        account_config_dir: str = OVERFLOW_2_CONFIG_DIR,
+        account_config_dir: Optional[str] = None,
         model: str = DEFAULT_MODEL,
         *args,
         identity_probe: Callable[[str], Dict[str, Any]] = _default_identity_probe,
@@ -205,7 +205,13 @@ class ClaudeCodeClient(ModelClient):
         Args:
             account_config_dir: the Claude CLI config directory (and therefore account) to pin to. MUST be
                 one of the allowed dedicated headless account dirs — anything else (including main or
-                overflow-1) raises `DisallowedAccountDirError` immediately.
+                overflow-1) raises `DisallowedAccountDirError` immediately. When omitted (the normal case —
+                callers that construct this via `generator.json`'s bare `ClaudeCodeClient()` never pass
+                this), falls back to the `DEEPWIKI_CLAUDE_ACCOUNT_DIR` env var if set, else `OVERFLOW_2_CONFIG_DIR`.
+                The env-var fallback exists because the account is otherwise hardcoded at the call site
+                (`RAG.py` constructs the configured model_client class with no args) — when the pinned
+                default account hits its own rate limit, this is how a caller switches the WHOLE server to
+                the designated backup (`overflow-3`) without a code change, just an env var + restart.
             model: default model id used when a call doesn't specify one.
             identity_probe: resolves `account_config_dir`'s REAL account identity (garvis-dip0
                 hardening) — defaults to a real `claude auth status` subprocess call. Overridable for
@@ -223,6 +229,9 @@ class ClaudeCodeClient(ModelClient):
                 otherwise not a recognized dedicated account.
         """
         super().__init__(*args, **kwargs)
+
+        if account_config_dir is None:
+            account_config_dir = os.environ.get("DEEPWIKI_CLAUDE_ACCOUNT_DIR") or OVERFLOW_2_CONFIG_DIR
 
         normalized = _normalize_dir(account_config_dir)
         allowed_normalized = [_normalize_dir(d) for d in _ALLOWED_ACCOUNT_DIRS]
