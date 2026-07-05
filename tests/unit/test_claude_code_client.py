@@ -22,44 +22,64 @@ from adalflow.core.types import ModelType
 from api.claude_code_client import (
     ClaudeCodeClient,
     DisallowedAccountDirError,
+    DisallowedAccountIdentityError,
     OVERFLOW_2_CONFIG_DIR,
     OVERFLOW_3_CONFIG_DIR,
     _guard_leading_slash,
 )
 
+# A fake identity probe standing in for a real `claude auth status` subprocess call, so every test
+# in this file stays hermetic (no live CLI/auth dependency) except the dedicated identity-guard
+# tests below, which exercise the refusal logic directly with their own fake probes.
+_FAKE_ALLOWED_PROBE = lambda account_config_dir: {"email": "claude-max-02@zentropi.ai"}  # noqa: E731
+
 
 def test_fail_closed_guard_rejects_main():
     with pytest.raises(DisallowedAccountDirError):
-        ClaudeCodeClient(account_config_dir="/Users/dwillner/.claude")
+        ClaudeCodeClient(account_config_dir="/Users/dwillner/.claude", identity_probe=_FAKE_ALLOWED_PROBE)
 
 
 def test_fail_closed_guard_rejects_overflow_1():
     with pytest.raises(DisallowedAccountDirError):
-        ClaudeCodeClient(account_config_dir="/Users/dwillner/.claude-overflow")
+        ClaudeCodeClient(account_config_dir="/Users/dwillner/.claude-overflow", identity_probe=_FAKE_ALLOWED_PROBE)
+
+
+def test_fail_closed_guard_rejects_main_without_ever_probing_identity():
+    """The cheap dir-allowlist check must run BEFORE the identity probe — a disallowed dir refuses
+    immediately without paying for a subprocess call at all."""
+    probe_calls = []
+
+    def spy_probe(account_config_dir):
+        probe_calls.append(account_config_dir)
+        return {"email": "claude-max-02@zentropi.ai"}
+
+    with pytest.raises(DisallowedAccountDirError):
+        ClaudeCodeClient(account_config_dir="/Users/dwillner/.claude", identity_probe=spy_probe)
+    assert probe_calls == [], "the identity probe must never be called when the dir check already refused"
 
 
 def test_fail_closed_guard_allows_overflow_2_default():
-    client = ClaudeCodeClient()
+    client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
     assert client._account_config_dir == OVERFLOW_2_CONFIG_DIR
     assert client._env["CLAUDE_CONFIG_DIR"] == OVERFLOW_2_CONFIG_DIR
 
 
 def test_fail_closed_guard_allows_overflow_3():
-    client = ClaudeCodeClient(account_config_dir=OVERFLOW_3_CONFIG_DIR)
+    client = ClaudeCodeClient(account_config_dir=OVERFLOW_3_CONFIG_DIR, identity_probe=_FAKE_ALLOWED_PROBE)
     assert client._account_config_dir == OVERFLOW_3_CONFIG_DIR
 
 
 def test_env_blanks_ambient_token_and_key():
     """The env-merge trap fix: both must be blanked, not just one, else an ambient value would win
     ClaudeAgentOptions.env's merge-onto-os.environ precedence."""
-    client = ClaudeCodeClient()
+    client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
     assert client._env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
     assert client._env["ANTHROPIC_API_KEY"] == ""
     assert client._env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == ""
 
 
 def test_convert_inputs_llm():
-    client = ClaudeCodeClient()
+    client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
     api_kwargs = client.convert_inputs_to_api_kwargs(
         input="hello", model_kwargs={"model": "claude-sonnet-4-6"}, model_type=ModelType.LLM
     )
@@ -67,15 +87,64 @@ def test_convert_inputs_llm():
 
 
 def test_convert_inputs_llm_defaults_model():
-    client = ClaudeCodeClient(model="claude-haiku-4-5")
+    client = ClaudeCodeClient(model="claude-haiku-4-5", identity_probe=_FAKE_ALLOWED_PROBE)
     api_kwargs = client.convert_inputs_to_api_kwargs(input="hi", model_kwargs={}, model_type=ModelType.LLM)
     assert api_kwargs["model"] == "claude-haiku-4-5"
 
 
 def test_convert_inputs_embedder_not_implemented():
-    client = ClaudeCodeClient()
+    client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
     with pytest.raises(NotImplementedError):
         client.convert_inputs_to_api_kwargs(input="hello", model_kwargs={}, model_type=ModelType.EMBEDDER)
+
+
+# --- garvis-dip0: identity-denylist guard (hardening beyond the directory allow-list) ---
+
+
+def test_identity_guard_allows_dedicated_max_account():
+    client = ClaudeCodeClient(identity_probe=lambda d: {"email": "claude-max-02@zentropi.ai"})
+    assert client._account_config_dir == OVERFLOW_2_CONFIG_DIR
+
+
+def test_identity_guard_allows_a_different_dedicated_max_account_number():
+    """The positive pattern is claude-max-N@zentropi.ai for ANY N — not hardcoded to -02/-03, so a
+    future re-numbered or additional dedicated account is accepted without a code change."""
+    client = ClaudeCodeClient(identity_probe=lambda d: {"email": "claude-max-07@zentropi.ai"})
+    assert client._account_config_dir == OVERFLOW_2_CONFIG_DIR
+
+
+def test_identity_guard_refuses_denylisted_personal_gmail():
+    with pytest.raises(DisallowedAccountIdentityError):
+        ClaudeCodeClient(identity_probe=lambda d: {"email": "dave.willner@gmail.com"})
+
+
+def test_identity_guard_refuses_denylisted_personal_zentropi():
+    with pytest.raises(DisallowedAccountIdentityError):
+        ClaudeCodeClient(identity_probe=lambda d: {"email": "dave@zentropi.ai"})
+
+
+def test_identity_guard_refuses_identity_not_matching_dedicated_pattern():
+    """Defense-in-depth beyond the explicit denylist: an identity that ISN'T on the denylist but also
+    isn't a recognized dedicated-account shape must still be refused — the allow-list is a positive
+    pattern, not just an exclusion of two known personal addresses."""
+    with pytest.raises(DisallowedAccountIdentityError):
+        ClaudeCodeClient(identity_probe=lambda d: {"email": "some-other-account@zentropi.ai"})
+
+
+def test_identity_guard_refuses_when_probe_reports_not_logged_in():
+    with pytest.raises(DisallowedAccountIdentityError):
+        ClaudeCodeClient(identity_probe=lambda d: {"loggedIn": False, "email": ""})
+
+
+def test_identity_guard_receives_the_account_config_dir_under_test():
+    seen = {}
+
+    def probe(account_config_dir):
+        seen["dir"] = account_config_dir
+        return {"email": "claude-max-03@zentropi.ai"}
+
+    ClaudeCodeClient(account_config_dir=OVERFLOW_3_CONFIG_DIR, identity_probe=probe)
+    assert seen["dir"] == OVERFLOW_3_CONFIG_DIR
 
 
 def test_guard_leading_slash_defuses_no_think_prefix():
@@ -108,7 +177,7 @@ async def test_acall_sets_tools_empty_not_just_allowed_tools():
         yield  # pragma: no cover — makes this an async generator; never actually reached.
 
     with patch("claude_agent_sdk.query", fake_query):
-        client = ClaudeCodeClient()
+        client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
         await client.acall(
             api_kwargs={"model": "claude-sonnet-4-6", "input": "hello"}, model_type=ModelType.LLM
         )
@@ -135,7 +204,7 @@ async def test_acall_raises_loudly_if_a_tool_use_ever_slips_through():
         )
 
     with patch("claude_agent_sdk.query", fake_query_with_tool_use):
-        client = ClaudeCodeClient()
+        client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
         with pytest.raises(RuntimeError, match="tool.*Bash"):
             await client.acall(
                 api_kwargs={"model": "claude-sonnet-4-6", "input": "hello"}, model_type=ModelType.LLM

@@ -36,9 +36,13 @@ with the precedent files, which — misleadingly — used only `allowed_tools=[]
 tool isolation empirically).
 """
 
+import json
 import logging
+import os
+import re
+import subprocess
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import anyio
 from adalflow.core.model_client import ModelClient
@@ -64,6 +68,53 @@ class DisallowedAccountDirError(Exception):
     """Fail-closed guard: the requested Claude config dir is not one of the allowed dedicated headless
     accounts. Raised at CONSTRUCTION time — before any query — so a misconfigured caller refuses loud
     instead of silently burning Dave's personal account (main/overflow-1)."""
+
+
+class DisallowedAccountIdentityError(DisallowedAccountDirError):
+    """Fail-closed guard (garvis-dip0): the pinned DIRECTORY passed the allow-list, but the ACCOUNT
+    IDENTITY resolved from it is not an allowed dedicated headless account — e.g. the pinned dir was
+    re-logged into Dave's personal account after the fact, or into some other unexpected account. The
+    directory allow-list alone does not catch this: it checks WHICH FOLDER was named, never WHO that
+    folder's credentials actually authenticate as. Subclasses `DisallowedAccountDirError` so any
+    existing caller that catches that already catches this too."""
+
+
+# Personal identities this provider must never run as, checked by exact match.
+_PERSONAL_EMAIL_DENYLIST = frozenset({"dave.willner@gmail.com", "dave@zentropi.ai"})
+
+# Positive pattern for a genuinely dedicated headless account (defense-in-depth beyond the denylist
+# above — refuses ANY identity that isn't shaped like one of these, not just the two known personal
+# addresses, so a typo'd or newly-added unexpected account is refused too, not silently allowed).
+_DEDICATED_ACCOUNT_EMAIL_PATTERN = re.compile(r"^claude-max-\d+@zentropi\.ai$")
+
+
+def _default_identity_probe(account_config_dir: str) -> Dict[str, Any]:
+    """Real probe: run `claude auth status` under the exact pinned+blanked env this client would use
+    for generation, and return the parsed JSON identity. Costs one subprocess spawn (a few hundred ms)
+    — `auth status` never calls the model API, so this consumes zero quota."""
+    env = {**os.environ, **_account_env(account_config_dir)}
+    result = subprocess.run(
+        ["claude", "auth", "status"], env=env, capture_output=True, text=True, timeout=15, check=True
+    )
+    return json.loads(result.stdout)
+
+
+def _assert_identity_allowed(account_config_dir: str, probe: Callable[[str], Dict[str, Any]]) -> None:
+    """Resolve the pinned dir's real account identity via `probe` and refuse (loud, before any query)
+    unless it is BOTH not on the personal denylist AND shaped like a dedicated `claude-max-N@zentropi.ai`
+    account. Raises `DisallowedAccountIdentityError` (never returns a "maybe") on any other identity,
+    including a probe reporting `loggedIn: False`."""
+    status = probe(account_config_dir)
+    email = status.get("email") or ""
+    is_denylisted = email in _PERSONAL_EMAIL_DENYLIST
+    is_dedicated_shape = bool(_DEDICATED_ACCOUNT_EMAIL_PATTERN.match(email))
+    if is_denylisted or not is_dedicated_shape:
+        raise DisallowedAccountIdentityError(
+            f"ClaudeCodeClient: refusing — account_config_dir {account_config_dir!r} resolved to "
+            f"identity {email!r}, which is either on the personal-account denylist or does not match "
+            "the dedicated headless account pattern (claude-max-N@zentropi.ai). This provider must "
+            "never run against Dave's personal account."
+        )
 
 
 def _normalize_dir(path: str) -> str:
@@ -126,6 +177,7 @@ class ClaudeCodeClient(ModelClient):
         account_config_dir: str = OVERFLOW_2_CONFIG_DIR,
         model: str = DEFAULT_MODEL,
         *args,
+        identity_probe: Callable[[str], Dict[str, Any]] = _default_identity_probe,
         **kwargs,
     ) -> None:
         """Initialize the Claude Code (Max) client, pinned to a dedicated headless account.
@@ -135,9 +187,20 @@ class ClaudeCodeClient(ModelClient):
                 one of the allowed dedicated headless account dirs — anything else (including main or
                 overflow-1) raises `DisallowedAccountDirError` immediately.
             model: default model id used when a call doesn't specify one.
+            identity_probe: resolves `account_config_dir`'s REAL account identity (garvis-dip0
+                hardening) — defaults to a real `claude auth status` subprocess call. Overridable for
+                tests so they never need a live authenticated CLI. Checked at CONSTRUCTION time, same
+                as the directory allow-list above, so both guards fail loud before any query — this
+                keeps the existing "construction succeeded => this instance is safe to query" invariant
+                intact rather than deferring half the safety check to first use. The cost (one
+                subprocess spawn, no model quota) is paid on every construction, matching the existing
+                dir-check's placement; this app already constructs a fresh client per request, so
+                there's no long-lived instance for a lazy/cached check to meaningfully save cost on.
 
         Raises:
             DisallowedAccountDirError: if `account_config_dir` is not an allowed dedicated account dir.
+            DisallowedAccountIdentityError: if the dir passes but its resolved identity is personal or
+                otherwise not a recognized dedicated account.
         """
         super().__init__(*args, **kwargs)
 
@@ -149,6 +212,8 @@ class ClaudeCodeClient(ModelClient):
                 f"allowed dedicated headless accounts {_ALLOWED_ACCOUNT_DIRS!r}. This provider must never "
                 f"run against Dave's personal account (main/overflow-1)."
             )
+
+        _assert_identity_allowed(account_config_dir, identity_probe)
 
         self._account_config_dir = account_config_dir
         self._default_model = model
