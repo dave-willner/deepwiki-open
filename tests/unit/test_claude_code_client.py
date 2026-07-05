@@ -327,3 +327,36 @@ async def test_acall_raises_loudly_if_a_tool_use_ever_slips_through():
             await client.acall(
                 api_kwargs={"model": "claude-sonnet-4-6", "input": "hello"}, model_type=ModelType.LLM
             )
+
+
+@pytest.mark.asyncio
+async def test_acall_logs_result_message_usage_stats(caplog):
+    """Real per-call token/cost usage (Dave asked what generation actually costs) must be logged
+    from the SDK's ResultMessage — the only place this class ever sees it, since acall() itself
+    only returns the generated text."""
+    import logging as _logging
+    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
+
+    async def fake_query(*, prompt, options):
+        yield AssistantMessage(model="claude-sonnet-4-6", content=[TextBlock(text="hi")])
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=500,
+            duration_api_ms=400,
+            is_error=False,
+            num_turns=1,
+            session_id="s1",
+            total_cost_usd=0.01,
+            usage={"input_tokens": 123, "output_tokens": 45},
+        )
+
+    with caplog.at_level(_logging.INFO, logger="api.claude_code_client"):
+        with patch("claude_agent_sdk.query", fake_query):
+            client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
+            await client.acall(
+                api_kwargs={"model": "claude-sonnet-4-6", "input": "hello"}, model_type=ModelType.LLM
+            )
+
+    usage_logs = [r.getMessage() for r in caplog.records if "usage" in r.getMessage().lower()]
+    assert usage_logs, "expected a logged line containing the ResultMessage usage stats"
+    assert "123" in usage_logs[0] and "45" in usage_logs[0]

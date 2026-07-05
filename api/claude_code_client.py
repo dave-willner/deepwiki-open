@@ -299,7 +299,14 @@ class ClaudeCodeClient(ModelClient):
             raise ValueError(f"Model type {model_type} is not supported by ClaudeCodeClient")
 
         # Lazy import so the absence of claude_agent_sdk doesn't break other providers at module import time.
-        from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, TextBlock, ToolUseBlock, query
+        from claude_agent_sdk import (
+            AssistantMessage,
+            ClaudeAgentOptions,
+            ResultMessage,
+            TextBlock,
+            ToolUseBlock,
+            query,
+        )
 
         model = api_kwargs.get("model", self._default_model)
         prompt = _guard_leading_slash(_strip_no_think_prefix(api_kwargs.get("input", "")))
@@ -335,6 +342,17 @@ class ClaudeCodeClient(ModelClient):
                             "tools=[] — this should be impossible; treat as a critical isolation failure, "
                             "not a retryable error."
                         )
+            elif isinstance(message, ResultMessage):
+                # Real per-call usage (Dave asked what generation actually costs, garvis 2026-07-05
+                # ~04:18): log it here so a driver script can recover it from the server log, since
+                # this class returns only the text — the caller has no other way to see token counts.
+                log.info(
+                    "ClaudeCodeClient usage: model=%r usage=%r total_cost_usd=%r duration_ms=%r",
+                    model,
+                    message.usage,
+                    message.total_cost_usd,
+                    message.duration_ms,
+                )
 
         return full_text
 
