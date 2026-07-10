@@ -3,8 +3,17 @@ garvis-9khs: drive deepwiki-open's real wiki-generation flow (structure-determin
 content, same verbatim prompt shapes as generate_js_pipeline_wiki.py) over projects/cope-tools-py —
 the Python CLR+Pareto package that replaced the JS pipeline's sdk-review-pipeline core. Unlike the
 JS-pipeline script, this one runs FULLY FROM SCRATCH: no prior cached structure is assumed, and the
-WHY/footguns steering doc (docs/SKILL-LAYER-GUIDANCE.md) is wired into pages by a KEYWORD heuristic
-rather than an exact-title list, since the page titles aren't known ahead of a real run.
+WHY/footguns steering content is wired into pages by a KEYWORD heuristic rather than an exact-title
+list, since the page titles aren't known ahead of a real run.
+
+Steering-doc correction (2026-07-10, lead ruling): the doc does NOT live in cope-tools-py/docs/ — it
+was never authored there. The real, actively-maintained steering content is
+projects/cope-data-adapter/skill-internal/SKILL-LAYER-GUIDANCE.md (CD's doc, updated 2026-07-06). Per
+the no-duplicate-copies ruling it is neither copied nor symlinked into cope-tools-py; instead this
+driver reads its content directly off disk at fire time and INLINES it client-side into steered
+pages' prompts (see STEERING_DOC_PATH / load_steering_doc() / generate_pages()) — never through the
+server's relevant_files/get_local_files_context, whose path-traversal guard correctly refuses to
+resolve a path outside REPO_PATH (by design; not weakened here).
 
 Rescued into this fork from /tmp (2026-07-05, /tmp reaps) so "run one command when the account
 window opens" is actually true — the durable copy IS the one to run, not a /tmp scratch copy.
@@ -45,14 +54,25 @@ OUTPUT_CACHE_PATH = "/tmp/cope-tools-wiki-full.json"
 # Dirs that are never source, regardless of what mutants* variant currently exists.
 STATIC_EXTRA_EXCLUDED_DIRS = ["./.garvis/", "./.pytest_cache/", "./.ruff_cache/"]
 
-STEERING_DOC = "docs/SKILL-LAYER-GUIDANCE.md"
+# Real, maintained location — NOT inside cope-tools-py (never copied/symlinked there; no-duplicates
+# ruling + don't drop files into another conversation's active production repo). Absolute path, read
+# once and inlined client-side into steered pages' prompts.
+STEERING_DOC_PATH = "/Users/dwillner/garvis/projects/cope-data-adapter/skill-internal/SKILL-LAYER-GUIDANCE.md"
 # The page titles aren't known ahead of a from-scratch run, so steering-page selection is a keyword
 # match against each page's title+description (case-insensitive) rather than an exact-title list —
 # any page whose topic plausibly touches the skill-layer contract (the CLR/relabel/optimize verbs,
-# fiat construction, the sequencing rules) gets the steering doc wired into its relevant_files.
+# fiat construction, the sequencing rules) gets the steering content inlined into its prompt.
 STEERING_KEYWORDS = (
     "clr", "relabel", "optimiz", "fiat", "pareto", "architecture", "overview", "verb", "sequenc",
 )
+
+
+def load_steering_doc():
+    with open(STEERING_DOC_PATH) as f:
+        content = f.read()
+    mtime = os.path.getmtime(STEERING_DOC_PATH)
+    print(f"Loaded steering doc: {STEERING_DOC_PATH} ({len(content)} chars, mtime={mtime})")
+    return content
 
 
 def current_mutants_dirs():
@@ -250,26 +270,43 @@ IMPORTANT:
 
 
 def generate_pages(pages_meta):
+    steering_content = load_steering_doc()
     generated_pages = {}
     for i, p in enumerate(pages_meta):
         print(f"=== Step 3.{i + 1}: generating page '{p['title']}' ===")
 
         steered = is_steering_candidate(p)
+        # relevant_files stays repo-only — this is what the server actually reads off disk via
+        # get_local_files_context; the steering doc lives OUTSIDE REPO_PATH and is never sent here.
         relevant_files = list(p["filePaths"])
-        if steered:
-            relevant_files = relevant_files + [STEERING_DOC]
+        # citation_files is what the reader sees cited on the page (the <details> block) — includes
+        # the steering doc's real path when steered, for citation honesty, even though it wasn't
+        # fetched via the server's relevant_files mechanism.
+        citation_files = relevant_files + [STEERING_DOC_PATH] if steered else relevant_files
 
-        file_list_md = "\n".join(f"- [{fp}]({fp})" for fp in relevant_files) or "- (no specific files listed)"
-        closing_instruction = (
-            f'7. WHY and Sequencing: {STEERING_DOC} is one of the RELEVANT_SOURCE_FILES for this '
-            'page. Where its content bears on this page\'s topic, include a dedicated '
-            '"## Design Rationale and Sequencing" section (or fold into an existing section) that '
-            'captures the WHY behind the design, the intended call sequencing, and any concrete '
-            'rules it states — quote or closely paraphrase the specific guidance, don\'t just '
-            'gesture at "there are rules."'
-            if steered
-            else '7. Conclusion: End with a brief summary paragraph.'
-        )
+        file_list_md = "\n".join(f"- [{fp}]({fp})" for fp in citation_files) or "- (no specific files listed)"
+        steering_block = ""
+        closing_instruction = '7. Conclusion: End with a brief summary paragraph.'
+        if steered:
+            steering_block = f"""
+
+ADDITIONAL STEERING CONTEXT — WHY and sequencing rules, inlined from {STEERING_DOC_PATH} (the
+skill-layer's actively-maintained design-rationale doc; not one of the RELEVANT_SOURCE_FILES above,
+but authoritative on the WHY and call-sequencing for the CLR/relabel/optimize verbs and fiat
+construction where this page's topic touches them):
+<steering_doc path="{STEERING_DOC_PATH}">
+{steering_content}
+</steering_doc>
+"""
+            closing_instruction = (
+                f'7. WHY and Sequencing: the ADDITIONAL STEERING CONTEXT block below (from '
+                f'{STEERING_DOC_PATH}) is authoritative on the WHY behind this design and the '
+                'intended call sequencing. Where its content bears on this page\'s topic, include a '
+                'dedicated "## Design Rationale and Sequencing" section (or fold into an existing '
+                'section) that captures the WHY, the intended call sequencing, and any concrete '
+                'rules it states — quote or closely paraphrase the specific guidance, don\'t just '
+                'gesture at "there are rules."'
+            )
         page_prompt = f"""You are an expert technical writer and software architect.
 Your task is to generate a comprehensive and accurate technical wiki page in Markdown format about a specific feature, system, or module within a given software project.
 
@@ -299,7 +336,7 @@ Based ONLY on the content of the [RELEVANT_SOURCE_FILES]:
 5. Source Citations: For significant information, cite the specific source file(s), e.g. `Sources: [filename.ext]()`.
 6. Technical Accuracy: All information must be derived SOLELY from the [RELEVANT_SOURCE_FILES]. Do not invent or use unrelated external knowledge.
 {closing_instruction}
-
+{steering_block}
 IMPORTANT: Generate the content in English language.
 
 WIKI_PAGE_TOPIC: {p['title']}
@@ -309,7 +346,7 @@ WIKI_PAGE_TOPIC: {p['title']}
             "id": p["id"],
             "title": p["title"],
             "content": content,
-            "filePaths": relevant_files,
+            "filePaths": citation_files,
             "importance": p["importance"],
             "relatedPages": p["relatedPages"],
         }
