@@ -180,7 +180,92 @@ def _clean_directory_token(raw_dir_entry: str) -> str:
     return token
 
 
-def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder: bool = None, 
+# Baseline directories the /local_repo/structure endpoint has always excluded, independent of any
+# caller-supplied excluded_dirs/included_dirs (garvis-11z.17). Deliberately NOT the same as
+# DEFAULT_EXCLUDED_DIRS (config.py) — that list includes entries like "./docs/" which are tuned for
+# embedding/retrieval quality, not for a structure-overview tree the LLM reads to design a wiki (a
+# repo's docs/ dir is often exactly what you want visible there). Keeping this endpoint's own
+# pre-existing default set preserves current behavior for every caller that passes no params.
+STRUCTURE_ENDPOINT_BASELINE_EXCLUDED_DIRS = ["__pycache__", "node_modules", ".venv"]
+
+
+def resolve_local_repo_structure(path: str, excluded_dirs: List[str] = None, included_dirs: List[str] = None):
+    """Walk a local repo and return (file_tree_str, readme_content), with the same
+    exclusion-vs-inclusion contract as read_all_documents/prepare_retriever (garvis-11z.17).
+
+    Before this, /local_repo/structure had NO exclusion param at all — just a hardcoded
+    hidden-dirs/__pycache__/node_modules/.venv filter baked into the walk, no way for a caller to
+    add more. That flooded the structure-determination prompt with huge non-source scratch dirs on
+    repos that have them (mutation-testing output, build artifacts) — the exact gap
+    prepare_retriever/read_all_documents already had a real fix for, so this reuses that fix
+    (_clean_directory_token) rather than a second, parallel filtering implementation.
+
+    Matching semantics, kept faithful to read_all_documents/should_process_file rather than a
+    simplified re-derivation:
+    - EXCLUSION MODE (default, or included_dirs empty): hidden directories (name starts with '.')
+      plus STRUCTURE_ENDPOINT_BASELINE_EXCLUDED_DIRS plus any caller-supplied excluded_dirs (all
+      normalized via _clean_directory_token) are PRUNED EARLY from the walk — safe here, since
+      excluding a directory always implies excluding everything under it.
+    - INCLUSION MODE (included_dirs non-empty): an included token can be several levels deep under
+      an otherwise-unmatched ancestor (e.g. included_dirs=["clr"] should still surface
+      src/cope_tools/clr/relabel.py even though "src" itself never matches). Early directory-name
+      pruning would break that, so inclusion mode does NOT prune by name — it walks broadly (only
+      '.git' is skipped, to avoid walking git's internal object store, which read_all_documents
+      never surfaces either since nothing in it matches a code/doc extension) and instead checks,
+      per FILE, whether any path component of that file's path matches an included token — the same
+      "clean_included in file_path_parts" test should_process_file uses.
+
+    File-level filtering (hidden files, __init__.py, .DS_Store) is unchanged in both modes; this
+    fixes the directory-level gap the bead named. excluded_files/included_files is a separate
+    surface read_all_documents already exposes and this endpoint has no caller asking for it.
+    """
+    use_inclusion_mode = bool(included_dirs)
+    included_tokens = [_clean_directory_token(d) for d in included_dirs] if use_inclusion_mode else []
+    excluded_tokens = set()
+    if not use_inclusion_mode:
+        excluded_tokens = {_clean_directory_token(d) for d in STRUCTURE_ENDPOINT_BASELINE_EXCLUDED_DIRS}
+        if excluded_dirs:
+            excluded_tokens |= {_clean_directory_token(d) for d in excluded_dirs}
+
+    def dir_pruning_allowed(dir_name: str) -> bool:
+        if use_inclusion_mode:
+            return dir_name != '.git'
+        if dir_name.startswith('.'):
+            return False
+        return dir_name not in excluded_tokens
+
+    def file_allowed(rel_file: str) -> bool:
+        if not use_inclusion_mode:
+            return True
+        file_path_parts = os.path.normpath(rel_file).split(os.sep)
+        return any(token in file_path_parts for token in included_tokens)
+
+    file_tree_lines = []
+    readme_content = ""
+
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if dir_pruning_allowed(d)]
+        for file in files:
+            if file.startswith('.') or file == '__init__.py' or file == '.DS_Store':
+                continue
+            rel_dir = os.path.relpath(root, path)
+            rel_file = os.path.join(rel_dir, file) if rel_dir != '.' else file
+            if not file_allowed(rel_file):
+                continue
+            file_tree_lines.append(rel_file)
+            if file.lower() == 'readme.md' and not readme_content:
+                try:
+                    with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
+                        readme_content = f.read()
+                except Exception as e:
+                    logger.warning(f"Could not read README.md: {str(e)}")
+                    readme_content = ""
+
+    file_tree_str = '\n'.join(sorted(file_tree_lines))
+    return file_tree_str, readme_content
+
+
+def read_all_documents(path: str, embedder_type: str = None, is_ollama_embedder: bool = None,
                       excluded_dirs: List[str] = None, excluded_files: List[str] = None,
                       included_dirs: List[str] = None, included_files: List[str] = None):
     """

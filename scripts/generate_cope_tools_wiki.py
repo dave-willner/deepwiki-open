@@ -18,14 +18,17 @@ resolve a path outside REPO_PATH (by design; not weakened here).
 Rescued into this fork from /tmp (2026-07-05, /tmp reaps) so "run one command when the account
 window opens" is actually true — the durable copy IS the one to run, not a /tmp scratch copy.
 
-Two things this script does that generate_js_pipeline_wiki.py didn't need:
-1. Client-side file_tree filtering for the structure-determination step: /local_repo/structure has
-   no exclusion param at all (unlike prepare_retriever) and this repo has dynamically-named
-   mutation-testing scratch dirs (mutants/, mutants.gate-aside-<timestamp>/, ~194MB each, possibly
-   actively written by a concurrent session) that would otherwise flood the structure prompt.
-2. Re-globbing the current mutants* dir names fresh before EVERY page-generation call (for the
-   excluded_dirs param that gates the FAISS-indexing path prepare_retriever always runs, even though
-   our fixed direct-read path doesn't use its result) — the dirs are actively appearing/disappearing.
+One thing this script does that generate_js_pipeline_wiki.py didn't need: re-globbing the current
+mutants* dir names fresh before EVERY call (structure-determination AND page-generation) — this repo
+has dynamically-named mutation-testing scratch dirs (mutants/, mutants.gate-aside-<timestamp>/,
+~194MB each, possibly actively written by a concurrent session) that would otherwise flood the
+structure prompt, and they're actively appearing/disappearing so a one-time glob would go stale.
+
+/local_repo/structure gap fix (garvis-11z.17, 2026-07-10): the endpoint used to have NO exclusion
+param at all (unlike prepare_retriever), so this script used to re-filter file_tree lines client-side
+after the fact. The endpoint now accepts the same excluded_dirs param prepare_retriever/
+read_all_documents does — this script just forwards excluded_dirs_payload() to it, same as it always
+did for the page-generation calls. One mechanism (server-side, _clean_directory_token-based), not two.
 
 Requires: deepwiki-open server running locally, DEEPWIKI_EMBEDDER_TYPE=ollama, and the pinned
 account (DEEPWIKI_CLAUDE_ACCOUNT_DIR or the default) off its rate/session limit.
@@ -90,8 +93,13 @@ def excluded_dirs_payload():
 
 
 def is_scratch_path(rel_path):
-    """Client-side filter for the structure-determination file_tree (no server-side exclusion
-    param exists for /local_repo/structure)."""
+    """Post-hoc SANITY CHECK only (garvis-11z.17) — the structure endpoint now does the real
+    filtering server-side via excluded_dirs, so the model never sees a scratch-dir path to pick in
+    the first place. This is a cheap, genuinely-different second check: if a page's model-chosen
+    filePaths ever DOES contain a scratch-dir entry despite that, something is wrong (a mismatch
+    between excluded_dirs_payload() and what the server actually excluded, a live mutants* dir
+    appearing between the structure call and here, etc.) and it's worth a loud warning rather than
+    silently generating a page from a mutation-testing scratch file."""
     first_component = rel_path.split(os.sep)[0]
     return (
         first_component.startswith("mutants")
@@ -130,23 +138,21 @@ def chat_stream(prompt_text, relevant_files=None):
     return full
 
 
-def get_local_repo_structure(path):
-    r = requests.get(f"{BASE}/local_repo/structure", params={"path": path}, timeout=60)
+def get_local_repo_structure(path, excluded_dirs=None):
+    params = {"path": path}
+    if excluded_dirs:
+        params["excluded_dirs"] = excluded_dirs
+    r = requests.get(f"{BASE}/local_repo/structure", params=params, timeout=60)
     r.raise_for_status()
     return r.json()
 
 
 def determine_structure():
-    print("=== Step 1: fetching local file tree + README (filtering scratch dirs client-side) ===")
-    structure_info = get_local_repo_structure(REPO_PATH)
-    raw_file_tree = structure_info["file_tree"]
+    print("=== Step 1: fetching local file tree + README (server-side excluded_dirs, garvis-11z.17) ===")
+    structure_info = get_local_repo_structure(REPO_PATH, excluded_dirs=excluded_dirs_payload())
+    file_tree = structure_info["file_tree"]
     readme = structure_info.get("readme", "") or "(no README.md found)"
-
-    raw_lines = raw_file_tree.splitlines()
-    filtered_lines = [line for line in raw_lines if not is_scratch_path(line)]
-    file_tree = "\n".join(filtered_lines)
-    print(f"file_tree entries: raw={len(raw_lines)} filtered={len(filtered_lines)} "
-          f"(dropped {len(raw_lines) - len(filtered_lines)} scratch-dir entries)")
+    print(f"file_tree entries: {len(file_tree.splitlines())}")
 
     determine_structure_prompt = f"""Analyze this repository cope-tools-py and create a wiki structure for it.
 

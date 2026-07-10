@@ -6,9 +6,12 @@ from fastapi.responses import JSONResponse, Response
 from typing import List, Optional, Dict, Any, Literal
 import json
 from datetime import datetime
+from urllib.parse import unquote
 from pydantic import BaseModel, Field
 import google.generativeai as genai
 import asyncio
+
+from api.data_pipeline import resolve_local_repo_structure
 
 # Configure logging
 from api.logging_config import setup_logging
@@ -273,8 +276,20 @@ async def export_wiki(request: WikiExportRequest):
         raise HTTPException(status_code=500, detail=error_msg)
 
 @app.get("/local_repo/structure")
-async def get_local_repo_structure(path: str = Query(None, description="Path to local repository")):
-    """Return the file tree and README content for a local repository."""
+async def get_local_repo_structure(
+    path: str = Query(None, description="Path to local repository"),
+    excluded_dirs: str = Query(None, description="Newline-separated list of directories to exclude from the file tree"),
+    included_dirs: str = Query(None, description="Newline-separated list of directories to include exclusively in the file tree"),
+):
+    """Return the file tree and README content for a local repository.
+
+    excluded_dirs/included_dirs (garvis-11z.17): this endpoint previously had NO exclusion
+    filtering at all — unlike prepare_retriever, which already has a real fix for exactly this
+    (read_all_documents' excluded_dirs/included_dirs, normalized via _clean_directory_token). That
+    gap flooded the structure-determination prompt with huge non-source scratch dirs on repos that
+    have them. Same newline-separated, URL-encoded-entry convention as simple_chat.py/
+    websocket_wiki.py's excluded_dirs field, so callers can reuse the same payload-building code.
+    """
     if not path:
         return JSONResponse(
             status_code=400,
@@ -289,28 +304,20 @@ async def get_local_repo_structure(path: str = Query(None, description="Path to 
 
     try:
         logger.info(f"Processing local repository at: {path}")
-        file_tree_lines = []
-        readme_content = ""
 
-        for root, dirs, files in os.walk(path):
-            # Exclude hidden dirs/files and virtual envs
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__' and d != 'node_modules' and d != '.venv']
-            for file in files:
-                if file.startswith('.') or file == '__init__.py' or file == '.DS_Store':
-                    continue
-                rel_dir = os.path.relpath(root, path)
-                rel_file = os.path.join(rel_dir, file) if rel_dir != '.' else file
-                file_tree_lines.append(rel_file)
-                # Find README.md (case-insensitive)
-                if file.lower() == 'readme.md' and not readme_content:
-                    try:
-                        with open(os.path.join(root, file), 'r', encoding='utf-8') as f:
-                            readme_content = f.read()
-                    except Exception as e:
-                        logger.warning(f"Could not read README.md: {str(e)}")
-                        readme_content = ""
+        parsed_excluded_dirs = None
+        if excluded_dirs:
+            parsed_excluded_dirs = [unquote(d) for d in excluded_dirs.split('\n') if d.strip()]
+            logger.info(f"Using custom excluded directories: {parsed_excluded_dirs}")
 
-        file_tree_str = '\n'.join(sorted(file_tree_lines))
+        parsed_included_dirs = None
+        if included_dirs:
+            parsed_included_dirs = [unquote(d) for d in included_dirs.split('\n') if d.strip()]
+            logger.info(f"Using custom included directories: {parsed_included_dirs}")
+
+        file_tree_str, readme_content = resolve_local_repo_structure(
+            path, excluded_dirs=parsed_excluded_dirs, included_dirs=parsed_included_dirs
+        )
         return {"file_tree": file_tree_str, "readme": readme_content}
     except Exception as e:
         logger.error(f"Error processing local repository: {str(e)}")
