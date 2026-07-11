@@ -27,6 +27,7 @@ from api.claude_code_client import (
     OVERFLOW_3_CONFIG_DIR,
     _guard_leading_slash,
     _strip_no_think_prefix,
+    probe_auth_liveness,
 )
 
 # A fake identity probe standing in for a real `claude auth status` subprocess call, so every test
@@ -360,3 +361,105 @@ async def test_acall_logs_result_message_usage_stats(caplog):
     usage_logs = [r.getMessage() for r in caplog.records if "usage" in r.getMessage().lower()]
     assert usage_logs, "expected a logged line containing the ResultMessage usage stats"
     assert "123" in usage_logs[0] and "45" in usage_logs[0]
+
+
+# --- garvis-4p24: probe_auth_liveness — a REAL liveness check, distinct from `claude auth status` ---
+# (PM's specimen: `claude auth status` returns loggedIn:true for a session that has actually expired
+# server-side; only a real round-trip query can observe the difference. Verified empirically against
+# our own dead overflow-3 account this same session.)
+
+
+def test_probe_auth_liveness_returns_true_on_a_genuinely_live_account():
+    from claude_agent_sdk import ResultMessage
+
+    async def fake_query(*, prompt, options):
+        yield ResultMessage(
+            subtype="success", duration_ms=500, duration_api_ms=400, is_error=False, num_turns=1,
+            session_id="s1", total_cost_usd=0.0001, result="OK",
+        )
+
+    with patch("claude_agent_sdk.query", fake_query):
+        live, detail = probe_auth_liveness(OVERFLOW_3_CONFIG_DIR)
+    assert live is True
+    assert detail == "ok"
+
+
+def test_probe_auth_liveness_returns_false_when_result_message_is_error():
+    """The structural check — never trust return TEXT alone (garvis-4p24's second finding: an auth
+    wrapper can mislabel its own text field 'success' even on genuine failure)."""
+    from claude_agent_sdk import ResultMessage
+
+    async def fake_query(*, prompt, options):
+        yield ResultMessage(
+            subtype="error_during_execution", duration_ms=100, duration_api_ms=50, is_error=True,
+            num_turns=0, session_id="s1", total_cost_usd=0.0, result="success",
+        )
+
+    with patch("claude_agent_sdk.query", fake_query):
+        live, detail = probe_auth_liveness(OVERFLOW_3_CONFIG_DIR)
+    assert live is False
+    assert "is_error=True" in detail
+
+
+def test_probe_auth_liveness_returns_false_on_an_auth_failure_text_signature():
+    """The textual check — catches an auth failure surfaced only as prose in a non-error result,
+    the exact 'raw CLI says OAuth session expired' case PM's specimen names."""
+    from claude_agent_sdk import ResultMessage
+
+    async def fake_query(*, prompt, options):
+        yield ResultMessage(
+            subtype="success", duration_ms=100, duration_api_ms=50, is_error=False, num_turns=1,
+            session_id="s1", total_cost_usd=0.0, result="Error: OAuth session expired, please re-authenticate.",
+        )
+
+    with patch("claude_agent_sdk.query", fake_query):
+        live, detail = probe_auth_liveness(OVERFLOW_3_CONFIG_DIR)
+    assert live is False
+    assert "oauth session expired" in detail.lower()
+
+
+def test_probe_auth_liveness_returns_false_when_the_probe_raises():
+    async def fake_query(*, prompt, options):
+        raise RuntimeError("subprocess spawn failed")
+        yield  # pragma: no cover — makes this an async generator; never actually reached.
+
+    with patch("claude_agent_sdk.query", fake_query):
+        live, detail = probe_auth_liveness(OVERFLOW_3_CONFIG_DIR)
+    assert live is False
+    assert "RuntimeError" in detail
+
+
+def test_probe_auth_liveness_returns_false_when_no_result_message_ever_arrives():
+    """Matches the actual observed symptom this specimen was built from: the process died silently
+    mid-subprocess-spawn, producing no ResultMessage at all — not an exception, not an error result,
+    just nothing."""
+
+    async def fake_query(*, prompt, options):
+        return
+        yield  # pragma: no cover — makes this an async generator; never actually reached.
+
+    with patch("claude_agent_sdk.query", fake_query):
+        live, detail = probe_auth_liveness(OVERFLOW_3_CONFIG_DIR)
+    assert live is False
+    assert "no ResultMessage" in detail
+
+
+def test_probe_auth_liveness_uses_the_pinned_accounts_env():
+    """The probe must build its env from the SAME account-pin-and-blank recipe as real generation
+    calls — not the ambient environment — else it could report a different account's liveness."""
+    captured = {}
+
+    async def fake_query(*, prompt, options):
+        captured["options"] = options
+        yield_from_nothing = None  # noqa: F841
+        return
+        yield  # pragma: no cover — makes this an async generator; never actually reached.
+
+    with patch("claude_agent_sdk.query", fake_query):
+        probe_auth_liveness(OVERFLOW_3_CONFIG_DIR)
+
+    options = captured["options"]
+    assert options.env["CLAUDE_CONFIG_DIR"] == OVERFLOW_3_CONFIG_DIR
+    assert options.env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
+    assert options.env["ANTHROPIC_API_KEY"] == ""
+    assert options.tools == [], "the probe must also run with zero tool availability, same as real generation"

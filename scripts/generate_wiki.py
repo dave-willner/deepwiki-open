@@ -19,9 +19,15 @@ Requires: deepwiki-open server running locally, DEEPWIKI_EMBEDDER_TYPE=ollama, a
 import json
 import os
 import re
+import sys
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import requests
+
+# So `from api.claude_code_client import ...` works from this scripts/ subdirectory (mirrors the
+# project_root sys.path setup every test file in tests/unit/ already uses).
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 BASE = "http://localhost:8055"
 PROVIDER = "claude-code"
@@ -363,7 +369,42 @@ def persist_and_verify(config, wiki_title, wiki_description, generated_pages):
     print(f"GATE: {config['repo']} wiki generated end-to-end with retrieval-fix + WHY/sequencing steering")
 
 
+def resolve_pinned_account_config_dir():
+    """Mirrors ClaudeCodeClient.__init__'s own env-var-fallback resolution exactly (the driver and the
+    server it talks to must be checking the SAME account, or a passing preflight proves nothing about
+    the account that will actually run the generation)."""
+    from api.claude_code_client import OVERFLOW_2_CONFIG_DIR
+
+    return os.environ.get("DEEPWIKI_CLAUDE_ACCOUNT_DIR") or OVERFLOW_2_CONFIG_DIR
+
+
+def preflight_auth_liveness():
+    """Fail LOUD, before any structure-determination or page-generation spend, if the pinned
+    account's OAuth session is actually dead server-side (garvis-4p24, PM's specimen: two silent
+    mid-page deaths this session, root-caused to overflow-3's OAuth expiring ~11:27 PT — `claude auth
+    status` alone is provably insufficient, since it reported `loggedIn: true` for that same dead
+    session; only a real round-trip query can tell). Runs ONCE per driver invocation (not once per
+    page-generation call, which would multiply the cost by page count for no extra signal) — see
+    `probe_auth_liveness` in api/claude_code_client.py for the actual check.
+
+    Raises SystemExit immediately on a dead account — never returns a "maybe", matching every other
+    fail-closed guard in this codebase (DisallowedAccountDirError / DisallowedAccountIdentityError).
+    """
+    from api.claude_code_client import probe_auth_liveness
+
+    account_config_dir = resolve_pinned_account_config_dir()
+    print(f"=== Step 0: auth-liveness preflight for {account_config_dir} (real probe, not just `claude auth status`) ===")
+    live, detail = probe_auth_liveness(account_config_dir)
+    if not live:
+        raise SystemExit(
+            f"FAILED PREFLIGHT: pinned account {account_config_dir!r} OAuth session appears DEAD — "
+            f"{detail}. Needs a human re-login (garvis-4p24); refusing to spend on generation."
+        )
+    print(f"  auth-liveness OK for {account_config_dir}")
+
+
 def run(config):
+    preflight_auth_liveness()
     wiki_title, wiki_description, pages_meta = determine_structure(config)
     generated_pages = generate_pages(config, pages_meta)
     persist_and_verify(config, wiki_title, wiki_description, generated_pages)

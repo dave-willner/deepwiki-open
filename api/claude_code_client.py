@@ -42,7 +42,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import anyio
 from adalflow.core.model_client import ModelClient
@@ -172,6 +172,87 @@ def _account_env(account_config_dir: str) -> Dict[str, str]:
         "ANTHROPIC_API_KEY": "",
         "CLAUDE_SECURESTORAGE_CONFIG_DIR": "",
     }
+
+
+_AUTH_FAILURE_TEXT_SIGNATURES = (
+    "oauth session expired",
+    "session expired",
+    "not logged in",
+    "please run",
+    "claude auth login",
+    "re-authenticate",
+    "authentication failed",
+    "invalid credentials",
+)
+
+
+def probe_auth_liveness(account_config_dir: str, model: str = DEFAULT_MODEL) -> Tuple[bool, str]:
+    """Real auth-liveness probe — distinct from `claude auth status` (the identity probe above), and
+    NOT a substitute for it (garvis-4p24, PM's specimen). `claude auth status` only reads a LOCAL
+    credentials file's presence/shape and reports `loggedIn: true` even when the underlying OAuth
+    SESSION has actually expired server-side — verified empirically against our own dead overflow-3
+    account: `auth status` returned `loggedIn: true` with the correct identity while every real
+    generation call against it died silently. This function issues ONE minimal REAL query
+    (`max_turns=1`, tool availability restricted to none, a trivial prompt) — the only thing that
+    actually round-trips to Anthropic's servers and can observe session death — and inspects the
+    actual `ResultMessage` rather than trusting any return text at face value: PM's companion
+    specimen found cope-tools-py's own auth-preflight wrapper mislabeling its result field
+    `"success"` even on a genuine auth failure, so this checks `is_error` structurally AND
+    separately scans the result text for known auth-failure signatures — never either alone.
+
+    Tests never need a live authenticated CLI — same convention as every other test in this module:
+    `unittest.mock.patch("claude_agent_sdk.query", fake_query)` before calling, since `query` is
+    imported locally inside this function (picks up the patched module attribute at call time).
+
+    Returns (True, "ok") if the account is genuinely live, or (False, <diagnostic message>) if it is
+    not — never raises itself; the caller decides how loud to fail (the driver-side preflight in
+    generate_wiki.py raises SystemExit on a False result, before spending on any real generation).
+    """
+    from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+
+    env = _account_env(account_config_dir)
+    # tools=[] is the field that actually restricts tool availability (allowed_tools only skips the
+    # permission prompt — see acall()'s own docstring finding above); this probe needs zero tools.
+    options = ClaudeAgentOptions(
+        max_turns=1,
+        tools=[],
+        model=model,
+        setting_sources=[],
+        cwd="/tmp",
+        disallowed_tools=["mcp__claude_ai_*"],
+        env=env,
+    )
+    async def _probe() -> Optional[Any]:
+        last_result = None
+        async for message in query(prompt="Reply with exactly: OK", options=options):
+            if isinstance(message, ResultMessage):
+                last_result = message
+        return last_result
+
+    try:
+        result = anyio.run(_probe)
+    except Exception as e:  # noqa: BLE001 - deliberately broad: ANY exception here means "not live"
+        return False, f"auth-liveness probe raised {type(e).__name__}: {e}"
+
+    if result is None:
+        return False, "auth-liveness probe produced no ResultMessage (subprocess likely died before completing)"
+
+    if getattr(result, "is_error", False):
+        return False, (
+            f"auth-liveness probe ResultMessage.is_error=True "
+            f"(subtype={getattr(result, 'subtype', None)!r}, result={getattr(result, 'result', None)!r})"
+        )
+
+    result_text = str(getattr(result, "result", "") or "")
+    lowered = result_text.lower()
+    for signature in _AUTH_FAILURE_TEXT_SIGNATURES:
+        if signature in lowered:
+            return False, (
+                f"auth-liveness probe result text matched an auth-failure signature "
+                f"({signature!r}): {result_text[:300]!r}"
+            )
+
+    return True, "ok"
 
 
 class ClaudeCodeClient(ModelClient):
