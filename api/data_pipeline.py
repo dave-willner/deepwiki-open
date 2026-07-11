@@ -219,20 +219,43 @@ def resolve_local_repo_structure(path: str, excluded_dirs: List[str] = None, inc
     fixes the directory-level gap the bead named. excluded_files/included_files is a separate
     surface read_all_documents already exposes and this endpoint has no caller asking for it.
     """
+    # NESTED-PATH EXCLUSION TOKENS (garvis-ownx gate finding): _clean_directory_token only strips a
+    # leading './' and trailing '/' — it never splits on internal '/'. So a token like './api/logs/'
+    # cleans to the single string 'api/logs', but dir_pruning_allowed below is called once per BARE
+    # directory NAME during os.walk pruning ('api', then separately 'logs') — neither of which ever
+    # equals the compound token 'api/logs', so a nested exclusion path silently never matches (found
+    # live: excluding a nested application-log directory left it in the tree). Fix: split excluded
+    # tokens into SIMPLE (no '/', matched against the bare dir_name — existing behavior, unchanged)
+    # and COMPOUND (contains '/', matched against that directory's own path relative to the repo
+    # root) — a compound token only prunes the exact nested directory named, never every directory
+    # sharing its last path component elsewhere in the tree.
     use_inclusion_mode = bool(included_dirs)
     included_tokens = [_clean_directory_token(d) for d in included_dirs] if use_inclusion_mode else []
-    excluded_tokens = set()
+    simple_excluded_tokens = set()
+    compound_excluded_tokens = set()
     if not use_inclusion_mode:
-        excluded_tokens = {_clean_directory_token(d) for d in STRUCTURE_ENDPOINT_BASELINE_EXCLUDED_DIRS}
-        if excluded_dirs:
-            excluded_tokens |= {_clean_directory_token(d) for d in excluded_dirs}
+        all_excluded = list(STRUCTURE_ENDPOINT_BASELINE_EXCLUDED_DIRS) + list(excluded_dirs or [])
+        for raw in all_excluded:
+            cleaned = _clean_directory_token(raw)
+            if '/' in cleaned:
+                compound_excluded_tokens.add(cleaned)
+            else:
+                simple_excluded_tokens.add(cleaned)
 
-    def dir_pruning_allowed(dir_name: str) -> bool:
+    def dir_pruning_allowed(dir_name: str, parent_root: str) -> bool:
         if use_inclusion_mode:
             return dir_name != '.git'
         if dir_name.startswith('.'):
             return False
-        return dir_name not in excluded_tokens
+        if dir_name in simple_excluded_tokens:
+            return False
+        if compound_excluded_tokens:
+            rel_parent = os.path.relpath(parent_root, path)
+            candidate_rel = dir_name if rel_parent == '.' else f"{rel_parent}/{dir_name}"
+            candidate_rel = candidate_rel.replace(os.sep, '/')
+            if candidate_rel in compound_excluded_tokens:
+                return False
+        return True
 
     def file_allowed(rel_file: str) -> bool:
         if not use_inclusion_mode:
@@ -244,7 +267,7 @@ def resolve_local_repo_structure(path: str, excluded_dirs: List[str] = None, inc
     readme_content = ""
 
     for root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if dir_pruning_allowed(d)]
+        dirs[:] = [d for d in dirs if dir_pruning_allowed(d, root)]
         for file in files:
             if file.startswith('.') or file == '__init__.py' or file == '.DS_Store':
                 continue

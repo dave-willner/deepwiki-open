@@ -103,6 +103,29 @@ def test_included_dirs_matches_a_nested_ancestor_not_just_the_immediate_director
     assert os.path.join("src", "cope_tools", "pareto", "optimize.py") not in lines
 
 
+def test_excluded_dirs_supports_a_nested_compound_path_token(tmp_path):
+    # garvis-ownx gate finding: _clean_directory_token only strips './' and trailing '/', never
+    # splits on internal '/' — so './api/logs/' cleaned down to the single string 'api/logs', but
+    # dir_pruning_allowed was called once per BARE directory name during the walk ('api', then
+    # separately 'logs'), neither of which ever equalled the compound token 'api/logs'. A nested
+    # exclusion path silently never matched. Also proves the fix is EXACT, not overreaching: a
+    # same-named 'logs' dir living somewhere else in the tree must survive.
+    _write(tmp_path / "api" / "main.py")
+    _write(tmp_path / "api" / "logs" / "application.log")
+    _write(tmp_path / "other" / "logs" / "keep.log")
+
+    file_tree_str, _ = resolve_local_repo_structure(str(tmp_path), excluded_dirs=["./api/logs/"])
+    lines = set(file_tree_str.splitlines())
+
+    assert os.path.join("api", "main.py") in lines
+    assert not any(line.startswith(os.path.join("api", "logs")) for line in lines), (
+        "excluding './api/logs/' must prune the nested api/logs directory"
+    )
+    assert os.path.join("other", "logs", "keep.log") in lines, (
+        "excluding './api/logs/' must NOT spuriously prune an unrelated dir elsewhere named 'logs'"
+    )
+
+
 def test_readme_is_still_found_case_insensitively(tmp_path):
     _write(tmp_path / "sub" / "Readme.md", "# Sub\n")
     file_tree_str, readme = resolve_local_repo_structure(str(tmp_path))
