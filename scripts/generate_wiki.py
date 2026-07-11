@@ -172,7 +172,20 @@ IMPORTANT:
         print("RAW STRUCTURE RESPONSE (no <wiki_structure> found):")
         print(xml_text[:2000])
         raise SystemExit("FAILED: could not locate <wiki_structure> in the response")
-    root = ET.fromstring(match.group(0))
+    # Hardening (garvis-9sfk gate finding): the model reliably escapes '&' inside its OWN generated
+    # <title>/<related> boilerplate but is not reliable about escaping a literal '&' that shows up in
+    # prose it's transcribing/paraphrasing (e.g. "System & Design Wiki") — a bare '&' is not valid XML
+    # and ET.fromstring hard-fails with "not well-formed (invalid token)" on it. Sanitize any '&' that
+    # isn't already part of a recognized entity reference (&amp; &lt; &gt; &apos; &quot; or a numeric
+    # &#123; / &#x1F;) before parsing. This is a real, reusable engine fix (every future wiki target
+    # can hit this the same way), not a one-off workaround for this run.
+    sanitized_xml = re.sub(r"&(?!(?:amp|lt|gt|apos|quot|#\d+|#x[0-9a-fA-F]+);)", "&amp;", match.group(0))
+    try:
+        root = ET.fromstring(sanitized_xml)
+    except ET.ParseError:
+        print("RAW STRUCTURE RESPONSE (ParseError even after & sanitization):")
+        print(sanitized_xml[:2000])
+        raise
 
     wiki_title = root.findtext("title", default="Untitled Wiki")
     wiki_description = root.findtext("description", default="")
