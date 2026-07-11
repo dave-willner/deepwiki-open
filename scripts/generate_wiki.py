@@ -202,6 +202,24 @@ IMPORTANT:
             "filePaths": file_paths, "relatedPages": related,
         })
 
+    # Hardening (garvis-gj8z gate finding): a target repo can contain a huge non-documentation data
+    # file (e.g. a 100MB+ mutation-testing report) that is harmless as a single file_tree LISTING
+    # entry (structure-determination only inlines the tree + README, never file contents) but would be
+    # catastrophic if the model ever picked it as a `relevant_file` — the server would then try to read
+    # the whole thing into a page-generation prompt. `disallowed_relevant_files` (optional, defaults to
+    # empty — every prior target leaves this unset and behavior is unchanged) is a client-side
+    # allowlist-adjacent filter applied AFTER structure-determination: any filePaths entry whose
+    # basename matches is stripped before generate_pages() ever builds a prompt, logged so it's never a
+    # silent drop.
+    disallowed = set(config.get("disallowed_relevant_files", []))
+    if disallowed:
+        for p in pages_meta:
+            kept = [fp for fp in p["filePaths"] if os.path.basename(fp) not in disallowed]
+            dropped = [fp for fp in p["filePaths"] if os.path.basename(fp) in disallowed]
+            if dropped:
+                print(f"  - {p['id']}: dropped disallowed relevant_files: {dropped}")
+            p["filePaths"] = kept
+
     print(f"Wiki title: {wiki_title!r}")
     print(f"Pages determined: {len(pages_meta)}")
     for p in pages_meta:
