@@ -9,6 +9,7 @@ alone does NOT disable built-in tools — only `tools=[]` does; without it a lon
 model into actually executing Bash and exploring the filesystem).
 """
 
+import os
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -25,7 +26,10 @@ from api.claude_code_client import (
     DisallowedAccountIdentityError,
     OVERFLOW_2_CONFIG_DIR,
     OVERFLOW_3_CONFIG_DIR,
+    _cleanup_scratch_cwd,
     _guard_leading_slash,
+    _new_scratch_cwd,
+    _SCRATCH_DIR_PREFIX,
     _strip_no_think_prefix,
     probe_auth_liveness,
 )
@@ -463,3 +467,183 @@ def test_probe_auth_liveness_uses_the_pinned_accounts_env():
     assert options.env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
     assert options.env["ANTHROPIC_API_KEY"] == ""
     assert options.tools == [], "the probe must also run with zero tool availability, same as real generation"
+
+
+# --- scratch-cwd isolation (garvis-11z.12.18.7): replaces the old hardcoded cwd="/tmp", which forced
+# every spawned CLI subprocess into a recursive index scan of /private/tmp's real, uptime-accumulated
+# clutter (verified empirically this session at 2,270 top-level entries / 13GB). A fresh, uniquely-named,
+# genuinely empty tempfile.mkdtemp() directory preserves the exact same isolation property (no ambient
+# CLAUDE.md/.mcp.json/project config there, ever) without paying that scan cost.
+
+def test_new_scratch_cwd_creates_a_genuinely_empty_directory():
+    path = _new_scratch_cwd()
+    try:
+        assert os.path.isdir(path)
+        assert os.listdir(path) == [], "a scratch cwd must be empty — that's the entire point of the fix"
+    finally:
+        _cleanup_scratch_cwd(path)
+
+
+def test_new_scratch_cwd_uses_the_documented_prefix():
+    path = _new_scratch_cwd()
+    try:
+        assert os.path.basename(path.rstrip("/")).startswith(_SCRATCH_DIR_PREFIX)
+    finally:
+        _cleanup_scratch_cwd(path)
+
+
+def test_new_scratch_cwd_returns_a_fresh_directory_on_every_call():
+    path_a = _new_scratch_cwd()
+    path_b = _new_scratch_cwd()
+    try:
+        assert path_a != path_b, "each call must be a distinct scratch dir — never shared/reused across calls"
+    finally:
+        _cleanup_scratch_cwd(path_a)
+        _cleanup_scratch_cwd(path_b)
+
+
+def test_cleanup_scratch_cwd_removes_the_directory():
+    path = _new_scratch_cwd()
+    assert os.path.isdir(path)
+    _cleanup_scratch_cwd(path)
+    assert not os.path.exists(path)
+
+
+def test_cleanup_scratch_cwd_is_a_silent_noop_on_an_already_missing_path():
+    """`ignore_errors=True` deliberately — a cleanup failure must never mask or replace the real call's
+    own success/failure. Calling cleanup twice (or on a path that was never created) must not raise."""
+    _cleanup_scratch_cwd("/tmp/this-scratch-dir-was-never-created-by-anything-nx4k2j")
+    path = _new_scratch_cwd()
+    _cleanup_scratch_cwd(path)
+    _cleanup_scratch_cwd(path)  # second call on the now-gone dir — still must not raise
+
+
+def test_probe_auth_liveness_uses_a_scratch_cwd_not_the_old_hardcoded_tmp():
+    from claude_agent_sdk import ResultMessage
+
+    captured = {}
+
+    async def fake_query(*, prompt, options):
+        captured["options"] = options
+        yield ResultMessage(
+            subtype="success", duration_ms=100, duration_api_ms=50, is_error=False, num_turns=1,
+            session_id="s1", total_cost_usd=0.0, result="OK",
+        )
+
+    with patch("claude_agent_sdk.query", fake_query):
+        probe_auth_liveness(OVERFLOW_3_CONFIG_DIR)
+
+    cwd_used = captured["options"].cwd
+    assert cwd_used != "/tmp", "must no longer hardcode the shared, cluttered /tmp as cwd"
+    assert os.path.basename(cwd_used.rstrip("/")).startswith(_SCRATCH_DIR_PREFIX)
+
+
+def test_probe_auth_liveness_cleans_up_its_scratch_cwd_after_the_call():
+    from claude_agent_sdk import ResultMessage
+
+    captured = {}
+
+    async def fake_query(*, prompt, options):
+        captured["options"] = options
+        yield ResultMessage(
+            subtype="success", duration_ms=100, duration_api_ms=50, is_error=False, num_turns=1,
+            session_id="s1", total_cost_usd=0.0, result="OK",
+        )
+
+    with patch("claude_agent_sdk.query", fake_query):
+        probe_auth_liveness(OVERFLOW_3_CONFIG_DIR)
+
+    assert not os.path.exists(captured["options"].cwd), (
+        "the scratch cwd must be removed after the probe completes — it's a per-call temp dir, not a "
+        "long-lived one"
+    )
+
+
+def test_probe_auth_liveness_cleans_up_its_scratch_cwd_even_when_the_probe_raises():
+    """The cleanup must happen in a `finally`, not just on the success path — a probe that raises
+    (e.g. subprocess spawn failure) must not leak its scratch directory."""
+    captured_cwd = {}
+    real_new_scratch_cwd = _new_scratch_cwd
+
+    def spying_new_scratch_cwd():
+        path = real_new_scratch_cwd()
+        captured_cwd["path"] = path
+        return path
+
+    async def fake_query(*, prompt, options):
+        raise RuntimeError("subprocess spawn failed")
+        yield  # pragma: no cover — makes this an async generator; never actually reached.
+
+    with patch("claude_agent_sdk.query", fake_query), \
+         patch("api.claude_code_client._new_scratch_cwd", spying_new_scratch_cwd):
+        live, _detail = probe_auth_liveness(OVERFLOW_3_CONFIG_DIR)
+
+    assert live is False
+    assert not os.path.exists(captured_cwd["path"]), "scratch cwd must be cleaned up even on a raised exception"
+
+
+@pytest.mark.asyncio
+async def test_acall_uses_a_scratch_cwd_not_the_old_hardcoded_tmp():
+    captured = {}
+
+    async def fake_query(*, prompt, options):
+        captured["options"] = options
+        return
+        yield  # pragma: no cover — makes this an async generator; never actually reached.
+
+    with patch("claude_agent_sdk.query", fake_query):
+        client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
+        await client.acall(
+            api_kwargs={"model": "claude-sonnet-4-6", "input": "hello"}, model_type=ModelType.LLM
+        )
+
+    cwd_used = captured["options"].cwd
+    assert cwd_used != "/tmp", "must no longer hardcode the shared, cluttered /tmp as cwd"
+    assert os.path.basename(cwd_used.rstrip("/")).startswith(_SCRATCH_DIR_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_acall_cleans_up_its_scratch_cwd_after_a_successful_call():
+    captured = {}
+
+    async def fake_query(*, prompt, options):
+        captured["options"] = options
+        return
+        yield  # pragma: no cover — makes this an async generator; never actually reached.
+
+    with patch("claude_agent_sdk.query", fake_query):
+        client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
+        await client.acall(
+            api_kwargs={"model": "claude-sonnet-4-6", "input": "hello"}, model_type=ModelType.LLM
+        )
+
+    assert not os.path.exists(captured["options"].cwd), (
+        "the scratch cwd must be removed after a successful call — it's a per-call temp dir"
+    )
+
+
+@pytest.mark.asyncio
+async def test_acall_cleans_up_its_scratch_cwd_even_when_a_tool_use_is_detected():
+    """Mirrors the existing tool-use-slips-through regression test, but asserts the `finally` cleanup
+    still runs on that raised-RuntimeError path — the scratch dir must never leak on an error exit."""
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock
+
+    captured = {}
+
+    async def fake_query(*, prompt, options):
+        captured["options"] = options
+        yield AssistantMessage(
+            content=[ToolUseBlock(id="tool-1", name="Bash", input={"command": "ls"})],
+            model="claude-sonnet-4-6",
+        )
+
+    with patch("claude_agent_sdk.query", fake_query):
+        client = ClaudeCodeClient(identity_probe=_FAKE_ALLOWED_PROBE)
+        with pytest.raises(RuntimeError):
+            await client.acall(
+                api_kwargs={"model": "claude-sonnet-4-6", "input": "hello"}, model_type=ModelType.LLM
+            )
+
+    assert not os.path.exists(captured["options"].cwd), (
+        "scratch cwd must be cleaned up even when acall() raises on an unexpected tool-use"
+    )

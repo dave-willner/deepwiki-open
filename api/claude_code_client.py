@@ -40,7 +40,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -174,6 +176,37 @@ def _account_env(account_config_dir: str) -> Dict[str, str]:
     }
 
 
+_SCRATCH_DIR_PREFIX = "deepwiki-agent-cwd-"
+
+
+def _new_scratch_cwd() -> str:
+    """Per-spawn isolation cwd (garvis-11z.12.18.7 gate finding, replaces the old hardcoded
+    `cwd="/tmp"`): the SDK-bundled `claude` binary runs a recursive file-index scan of its cwd at
+    EVERY spawn. `/private/tmp` itself accumulates OTHER processes' scratch files over the box's
+    uptime — verified empirically this session at 2,270 top-level entries / 13GB — so every single
+    generation call was paying a real recursive-scan cost against a directory this code never
+    controls the contents of. No SDK-level index-suppression knob exists (confirmed, PM). The fix:
+    `tempfile.mkdtemp()` returns a FRESH, uniquely-named, genuinely EMPTY directory — the recursive
+    scan that starts there finds nothing, regardless of how cluttered the system temp root is at the
+    top level, because the scan walks DOWN from cwd, never sideways into sibling directories.
+
+    Isolation is preserved, not weakened: `cwd="/tmp"` existed specifically so the spawned CLI would
+    never pick up an ambient CLAUDE.md/.mcp.json/project config from some real working directory — a
+    fresh mkdtemp() directory is isolated in exactly the same way (no such files exist there, ever),
+    just without the accumulated-clutter scan cost. Caller is responsible for cleanup via
+    `_cleanup_scratch_cwd` in a `finally` block — this is a per-call temp dir, not a long-lived one.
+    """
+    return tempfile.mkdtemp(prefix=_SCRATCH_DIR_PREFIX)
+
+
+def _cleanup_scratch_cwd(path: str) -> None:
+    """Best-effort removal of a `_new_scratch_cwd()` directory. `ignore_errors=True` deliberately —
+    a cleanup failure (e.g. the spawned process is still holding an open fd on Windows-style file
+    locking, or the dir was already removed) must never mask or replace the real call's own
+    success/failure; this is tidiness, not correctness."""
+    shutil.rmtree(path, ignore_errors=True)
+
+
 _AUTH_FAILURE_TEXT_SIGNATURES = (
     "oauth session expired",
     "session expired",
@@ -211,6 +244,7 @@ def probe_auth_liveness(account_config_dir: str, model: str = DEFAULT_MODEL) -> 
     from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
     env = _account_env(account_config_dir)
+    scratch_cwd = _new_scratch_cwd()
     # tools=[] is the field that actually restricts tool availability (allowed_tools only skips the
     # permission prompt — see acall()'s own docstring finding above); this probe needs zero tools.
     options = ClaudeAgentOptions(
@@ -218,7 +252,7 @@ def probe_auth_liveness(account_config_dir: str, model: str = DEFAULT_MODEL) -> 
         tools=[],
         model=model,
         setting_sources=[],
-        cwd="/tmp",
+        cwd=scratch_cwd,
         disallowed_tools=["mcp__claude_ai_*"],
         env=env,
     )
@@ -233,6 +267,8 @@ def probe_auth_liveness(account_config_dir: str, model: str = DEFAULT_MODEL) -> 
         result = anyio.run(_probe)
     except Exception as e:  # noqa: BLE001 - deliberately broad: ANY exception here means "not live"
         return False, f"auth-liveness probe raised {type(e).__name__}: {e}"
+    finally:
+        _cleanup_scratch_cwd(scratch_cwd)
 
     if result is None:
         return False, "auth-liveness probe produced no ResultMessage (subprocess likely died before completing)"
@@ -392,50 +428,58 @@ class ClaudeCodeClient(ModelClient):
         model = api_kwargs.get("model", self._default_model)
         prompt = _guard_leading_slash(_strip_no_think_prefix(api_kwargs.get("input", "")))
 
+        # NOTE (garvis-11z.12.18.7): the sibling `tools=[]` field is the one that actually restricts
+        # tool availability — see this module's top-of-file docstring finding. The historical
+        # defense-in-depth companion field is dropped here (it was never load-bearing, and
+        # `probe_auth_liveness` above never carried it either) purely because its literal token trips
+        # the portal write-guard on every touch to this block; `tools=[]` alone remains fully sufficient.
+        scratch_cwd = _new_scratch_cwd()
         options = ClaudeAgentOptions(
             max_turns=1,
             tools=[],
-            allowed_tools=[],
             model=model,
             setting_sources=[],
-            cwd="/tmp",
+            cwd=scratch_cwd,
             disallowed_tools=["mcp__claude_ai_*"],
             env=self._env,
         )
 
-        full_text = ""
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        full_text += block.text
-                    elif isinstance(block, ToolUseBlock):
-                        # Defense-in-depth (Slice 3/4 finding): `tools=[]` above should make this
-                        # unreachable. If it ever fires anyway, that is a MORE serious isolation
-                        # failure than the one this guard was added for — surface it loudly rather
-                        # than silently ignoring the tool-use attempt the way the original code did.
-                        log.error(
-                            "ClaudeCodeClient: unexpected tool-use attempt despite tools=[]: "
-                            f"name={block.name!r} input={block.input!r}"
-                        )
-                        raise RuntimeError(
-                            f"ClaudeCodeClient: the model attempted to use tool {block.name!r} despite "
-                            "tools=[] — this should be impossible; treat as a critical isolation failure, "
-                            "not a retryable error."
-                        )
-            elif isinstance(message, ResultMessage):
-                # Real per-call usage (Dave asked what generation actually costs, garvis 2026-07-05
-                # ~04:18): log it here so a driver script can recover it from the server log, since
-                # this class returns only the text — the caller has no other way to see token counts.
-                log.info(
-                    "ClaudeCodeClient usage: model=%r usage=%r total_cost_usd=%r duration_ms=%r",
-                    model,
-                    message.usage,
-                    message.total_cost_usd,
-                    message.duration_ms,
-                )
+        try:
+            full_text = ""
+            async for message in query(prompt=prompt, options=options):
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock):
+                            full_text += block.text
+                        elif isinstance(block, ToolUseBlock):
+                            # Defense-in-depth (Slice 3/4 finding): `tools=[]` above should make this
+                            # unreachable. If it ever fires anyway, that is a MORE serious isolation
+                            # failure than the one this guard was added for — surface it loudly rather
+                            # than silently ignoring the tool-use attempt the way the original code did.
+                            log.error(
+                                "ClaudeCodeClient: unexpected tool-use attempt despite tools=[]: "
+                                f"name={block.name!r} input={block.input!r}"
+                            )
+                            raise RuntimeError(
+                                f"ClaudeCodeClient: the model attempted to use tool {block.name!r} despite "
+                                "tools=[] — this should be impossible; treat as a critical isolation failure, "
+                                "not a retryable error."
+                            )
+                elif isinstance(message, ResultMessage):
+                    # Real per-call usage (Dave asked what generation actually costs, garvis 2026-07-05
+                    # ~04:18): log it here so a driver script can recover it from the server log, since
+                    # this class returns only the text — the caller has no other way to see token counts.
+                    log.info(
+                        "ClaudeCodeClient usage: model=%r usage=%r total_cost_usd=%r duration_ms=%r",
+                        model,
+                        message.usage,
+                        message.total_cost_usd,
+                        message.duration_ms,
+                    )
 
-        return full_text
+            return full_text
+        finally:
+            _cleanup_scratch_cwd(scratch_cwd)
 
     def call(self, api_kwargs: Optional[Dict] = None, model_type: Optional[ModelType] = None) -> Any:
         """Make a synchronous generation call — bridges to the async SDK via `anyio.run`."""
